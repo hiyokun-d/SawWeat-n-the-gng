@@ -31,7 +31,8 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { BASEMAPS, type BasemapId } from "@/lib/basemaps";
+import { useMapEngine } from "@/hooks/useMapEngine";
+import { MAP_STYLES, type MapStyleId } from "@/lib/basemaps";
 import { db, type WatchArea } from "@/lib/db";
 import {
   FIRMS_SOURCES,
@@ -46,8 +47,6 @@ import type { DrawMode, FireMapProps } from "./map/types";
 // Both map libraries touch `window` on import, so they are client-only.
 const LeafletMap = dynamic(() => import("./map/LeafletMap"), { ssr: false });
 const MapLibreMap = dynamic(() => import("./map/MapLibreMap"), { ssr: false });
-
-type Engine = "leaflet" | "maplibre";
 
 const SOURCE_ITEMS = FIRMS_SOURCES.map((s) => ({ value: s.id, label: s.label }));
 const DAY_ITEMS = [1, 2, 3, 4, 5].map((d) => ({
@@ -72,8 +71,8 @@ type ScanState =
   | { status: "error"; message: string };
 
 export default function FireDashboard() {
-  const [engine, setEngine] = useState<Engine>("maplibre");
-  const [basemap, setBasemap] = useState<BasemapId>("dark");
+  const { engine, state: engineState, markReady, markFailed } = useMapEngine();
+  const [mapStyle, setMapStyle] = useState<MapStyleId>("liberty");
   const [source, setSource] = useState<string>(FIRMS_SOURCES[0].id);
   const [days, setDays] = useState("1");
   const [drawMode, setDrawMode] = useState<DrawMode>("static");
@@ -201,16 +200,27 @@ export default function FireDashboard() {
     return { count: fires.length, high, frp };
   }, [fires]);
 
-  const Map = engine === "leaflet" ? LeafletMap : MapLibreMap;
-  const mapProps: FireMapProps = {
+  // Both engines can be mounted at once (Leaflet on top while MapLibre loads underneath);
+  // only the visible one may drive the viewport.
+  const engineRef = useRef(engine);
+  useEffect(() => {
+    engineRef.current = engine;
+  }, [engine]);
+  const viewportFrom = useCallback(
+    (source: typeof engine) => (bbox: BBox) => {
+      if (engineRef.current === source) onViewportChange(bbox);
+    },
+    [onViewportChange],
+  );
+
+  const mapProps: Omit<FireMapProps, "onViewportChange"> = {
     fires,
     areas,
     activeAreaId,
     drawMode,
-    basemap,
+    mapStyle,
     focus,
     onAreaDrawn,
-    onViewportChange,
     onFireClick: setSelectedFire,
   };
 
@@ -235,18 +245,13 @@ export default function FireDashboard() {
         <ScrollArea className="min-h-0 flex-1">
           <div className="flex flex-col gap-5 p-4">
             <section className="flex flex-col gap-2">
-              <Label>Map engine</Label>
-              <Tabs value={engine} onValueChange={(v) => setEngine(v as Engine)}>
+              <Label>Map</Label>
+              <EngineStatus state={engineState} />
+              <Tabs value={mapStyle} onValueChange={(v) => setMapStyle(v as MapStyleId)}>
                 <TabsList className="w-full">
-                  <TabsTrigger value="leaflet">Leaflet</TabsTrigger>
-                  <TabsTrigger value="maplibre">MapLibre GL</TabsTrigger>
-                </TabsList>
-              </Tabs>
-              <Tabs value={basemap} onValueChange={(v) => setBasemap(v as BasemapId)}>
-                <TabsList className="w-full">
-                  {BASEMAPS.map((b) => (
-                    <TabsTrigger key={b.id} value={b.id}>
-                      {b.label}
+                  {MAP_STYLES.map((s) => (
+                    <TabsTrigger key={s.id} value={s.id} disabled={engine !== "maplibre"}>
+                      {s.label}
                     </TabsTrigger>
                   ))}
                 </TabsList>
@@ -371,7 +376,29 @@ export default function FireDashboard() {
 
       {/* Map */}
       <main className="relative min-w-0 flex-1">
-        <Map key={engine} {...mapProps} />
+        {engineState.status !== "fallback" && (
+          <div className="absolute inset-0 z-0">
+            <MapLibreMap
+              {...mapProps}
+              onViewportChange={viewportFrom("maplibre")}
+              onReady={markReady}
+              onFail={markFailed}
+            />
+          </div>
+        )}
+        {/* Leaflet sits on top until MapLibre is ready, then fades away to reveal it */}
+        <AnimatePresence>
+          {engine === "leaflet" && (
+            <motion.div
+              key="leaflet"
+              className="absolute inset-0 z-[5]"
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.8 }}
+            >
+              <LeafletMap {...mapProps} onViewportChange={viewportFrom("leaflet")} />
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <AnimatePresence>
           {drawMode !== "static" && (
@@ -401,6 +428,31 @@ export default function FireDashboard() {
         </AnimatePresence>
       </main>
     </div>
+  );
+}
+
+function EngineStatus({ state }: { state: ReturnType<typeof useMapEngine>["state"] }) {
+  if (state.status === "ready") {
+    return (
+      <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <span className="size-2 rounded-full bg-emerald-500" />
+        MapLibre GL · WebGL 3D
+      </p>
+    );
+  }
+  if (state.status === "loading") {
+    return (
+      <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Loader2Icon className="size-3.5 animate-spin" />
+        Loading 3D map — showing Leaflet preview
+      </p>
+    );
+  }
+  return (
+    <p className="flex items-start gap-1.5 text-xs text-amber-500">
+      <span className="mt-1 size-2 shrink-0 rounded-full bg-amber-500" />
+      Leaflet fallback (OpenStreetMap): {state.reason}
+    </p>
   );
 }
 

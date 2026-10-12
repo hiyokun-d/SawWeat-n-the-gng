@@ -1,45 +1,23 @@
-// Keyless raster basemaps, shared by the Leaflet and MapLibre maps.
-// Each basemap is a stack of tile layers drawn bottom to top (base, then labels).
+// Free, keyless map sources.
 
-export interface Basemap {
-  id: string;
-  label: string;
-  attribution: string;
-  layers: { url: string; maxZoom: number }[];
+// OpenFreeMap vector styles for MapLibre (attribution is embedded in each style)
+export const MAP_STYLES = [
+  { id: "liberty", label: "Liberty", url: "https://tiles.openfreemap.org/styles/liberty" },
+  { id: "bright", label: "Bright", url: "https://tiles.openfreemap.org/styles/bright" },
+  { id: "positron", label: "Positron", url: "https://tiles.openfreemap.org/styles/positron" },
+] as const;
+
+export type MapStyleId = (typeof MAP_STYLES)[number]["id"];
+
+export function getMapStyle(id: MapStyleId) {
+  return MAP_STYLES.find((s) => s.id === id) ?? MAP_STYLES[0];
 }
 
-const ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services";
-const FIRMS_CREDIT = "Fire data: NASA FIRMS";
+// OpenStreetMap raster tiles for the Leaflet fallback
+export const OSM_TILES = {
+  url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  attribution: "&copy; OpenStreetMap contributors",
+  maxZoom: 19,
+};
 
-export const BASEMAPS = [
-  {
-    id: "dark",
-    label: "Dark",
-    attribution: `Tiles &copy; Esri, HERE, Garmin, &copy; OpenStreetMap contributors | ${FIRMS_CREDIT}`,
-    layers: [
-      { url: `${ESRI}/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}`, maxZoom: 16 },
-      { url: `${ESRI}/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}`, maxZoom: 16 },
-    ],
-  },
-  {
-    id: "satellite",
-    label: "Satellite",
-    attribution: `Tiles &copy; Esri, Maxar, Earthstar Geographics | ${FIRMS_CREDIT}`,
-    layers: [
-      { url: `${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`, maxZoom: 19 },
-      { url: `${ESRI}/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}`, maxZoom: 19 },
-    ],
-  },
-  {
-    id: "streets",
-    label: "Streets",
-    attribution: `&copy; OpenStreetMap contributors | ${FIRMS_CREDIT}`,
-    layers: [{ url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png", maxZoom: 19 }],
-  },
-] as const satisfies readonly Basemap[];
-
-export type BasemapId = (typeof BASEMAPS)[number]["id"];
-
-export function getBasemap(id: BasemapId): Basemap {
-  return BASEMAPS.find((b) => b.id === id) ?? BASEMAPS[0];
-}
+export const FIRMS_ATTRIBUTION = "Fire data: NASA FIRMS";

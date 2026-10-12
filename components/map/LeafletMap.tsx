@@ -5,19 +5,18 @@ import L from "leaflet";
 import { useEffect, useRef } from "react";
 import type { TerraDraw } from "terra-draw";
 import { TerraDrawLeafletAdapter } from "terra-draw-leaflet-adapter";
-import { getBasemap } from "@/lib/basemaps";
+import { FIRMS_ATTRIBUTION, OSM_TILES } from "@/lib/basemaps";
 import { confidenceColor, fireRadius } from "@/lib/fire-types";
 import { createTerraDraw } from "./terra";
 import { INITIAL_CENTER, INITIAL_ZOOM, type FireMapProps } from "./types";
 
 export default function LeafletMap(props: FireMapProps) {
-  const { fires, areas, activeAreaId, drawMode, basemap, focus } = props;
+  const { fires, areas, activeAreaId, drawMode, focus } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const drawRef = useRef<TerraDraw | null>(null);
   const firesLayer = useRef<L.LayerGroup | null>(null);
   const areasLayer = useRef<L.LayerGroup | null>(null);
-  const baseLayer = useRef<L.LayerGroup | null>(null);
   // Keep latest callbacks without re-creating the map
   const cb = useRef(props);
   useEffect(() => {
@@ -30,7 +29,10 @@ export default function LeafletMap(props: FireMapProps) {
       zoomControl: false,
     }).setView([INITIAL_CENTER[1], INITIAL_CENTER[0]], INITIAL_ZOOM);
     L.control.zoom({ position: "bottomright" }).addTo(map);
-    baseLayer.current = L.layerGroup().addTo(map);
+    L.tileLayer(OSM_TILES.url, {
+      maxZoom: OSM_TILES.maxZoom,
+      attribution: `${OSM_TILES.attribution} | ${FIRMS_ATTRIBUTION}`,
+    }).addTo(map);
 
     areasLayer.current = L.layerGroup().addTo(map);
     firesLayer.current = L.layerGroup().addTo(map);
@@ -58,21 +60,6 @@ export default function LeafletMap(props: FireMapProps) {
       drawRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    const layer = baseLayer.current;
-    if (!layer) return;
-    layer.clearLayers();
-    const { layers, attribution } = getBasemap(basemap);
-    layers.forEach(({ url, maxZoom }, i) =>
-      L.tileLayer(url, {
-        maxZoom: 19,
-        maxNativeZoom: maxZoom,
-        // Credit once per basemap, not once per tile layer
-        attribution: i === 0 ? attribution : undefined,
-      }).addTo(layer),
-    );
-  }, [basemap]);
 
   useEffect(() => {
     drawRef.current?.setMode(drawMode);

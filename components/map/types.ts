@@ -1,7 +1,7 @@
 import type { Polygon } from "geojson";
 import type { BBox, Fire } from "@/lib/fire-types";
 import type { WatchArea } from "@/lib/db";
-import type { BasemapId } from "@/lib/basemaps";
+import type { MapStyleId } from "@/lib/basemaps";
 
 export type DrawMode = "static" | "polygon" | "rectangle" | "circle" | "freehand";
 
@@ -10,7 +10,8 @@ export interface FireMapProps {
   areas: WatchArea[];
   activeAreaId: string | null;
   drawMode: DrawMode;
-  basemap: BasemapId;
+  // OpenFreeMap style (MapLibre only; Leaflet always uses OSM raster tiles)
+  mapStyle: MapStyleId;
   // Bumped by the parent to fly the map to a bbox
   focus: { bbox: BBox; nonce: number } | null;
   onAreaDrawn: (geometry: Polygon) => void;

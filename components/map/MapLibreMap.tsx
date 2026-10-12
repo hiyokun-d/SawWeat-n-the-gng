@@ -6,6 +6,7 @@ import type { GeoJSONSource } from "maplibre-gl";
 import type { FeatureCollection, Point, Polygon } from "geojson";
 import {
   BoxIcon,
+  Building2Icon,
   CompassIcon,
   GlobeIcon,
   MountainSnowIcon,
@@ -16,8 +17,9 @@ import { useEffect, useRef, useState } from "react";
 import type { TerraDraw } from "terra-draw";
 import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import { Button } from "@/components/ui/button";
-import { getBasemap } from "@/lib/basemaps";
+import { FIRMS_ATTRIBUTION, getMapStyle } from "@/lib/basemaps";
 import type { Fire } from "@/lib/fire-types";
+import { addTerrainLayers, setTerrainEnabled } from "@/lib/terrain";
 import { createTerraDraw } from "./terra";
 import { INITIAL_CENTER, INITIAL_ZOOM, type FireMapProps } from "./types";
 
@@ -28,13 +30,10 @@ maplibregl.setWorkerUrl(
   new URL("../../node_modules/maplibre-gl/dist/maplibre-gl-worker.mjs", import.meta.url).href,
 );
 
-// Basemap raster layers are added at runtime (below the data layers) so they can be swapped
-const STYLE: maplibregl.StyleSpecification = { version: 8, sources: {}, layers: [] };
-const BASEMAP_PREFIX = "basemap-";
-
-// Keyless Terrarium-encoded elevation tiles (AWS Open Data / Mapzen)
-const DEM_TILES = ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"];
-const DEM_ATTRIBUTION = "Elevation &copy; Mapzen, AWS Open Data";
+export interface MapLibreMapProps extends FireMapProps {
+  onReady: () => void;
+  onFail: (reason: string) => void;
+}
 
 const CONFIDENCE_COLOR: maplibregl.ExpressionSpecification = [
   "match",
@@ -51,190 +50,100 @@ const HOME_CAMERA = { center: INITIAL_CENTER, zoom: INITIAL_ZOOM + 0.5, pitch: 4
 const PULSE_MS = 1600;
 const GROW_MS = 1400;
 
-export default function MapLibreMap(props: FireMapProps) {
-  const { fires, areas, activeAreaId, drawMode, basemap, focus } = props;
+export default function MapLibreMap(props: MapLibreMapProps) {
+  const { fires, areas, activeAreaId, drawMode, mapStyle, focus } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const drawRef = useRef<TerraDraw | null>(null);
-  const [ready, setReady] = useState(false);
+  const appliedStyle = useRef(mapStyle);
+  // Bumped every time a style finishes loading and our overlays are (re)installed;
+  // data/paint effects depend on it so they re-apply after a style switch.
+  const [styleVersion, setStyleVersion] = useState(0);
+  const ready = styleVersion > 0;
   const [globe, setGlobe] = useState(true);
   const [terrain, setTerrain] = useState(true);
+  const [buildings, setBuildings] = useState(true);
   const [columns, setColumns] = useState(true);
   const [orbit, setOrbit] = useState(false);
+  const env = useRef({ globe, terrain, buildings, columns });
   const cb = useRef(props);
   useEffect(() => {
     cb.current = props;
+    env.current = { globe, terrain, buildings, columns };
   });
 
   useEffect(() => {
-    const map = new maplibregl.Map({
-      container: containerRef.current!,
-      style: STYLE,
-      // Start zoomed out on the globe; the load handler flies in
-      center: [INITIAL_CENTER[0] - 40, INITIAL_CENTER[1] + 10],
-      zoom: 1.2,
-      maxPitch: 75,
-      attributionControl: { compact: true },
-    });
+    let map: maplibregl.Map;
+    try {
+      map = new maplibregl.Map({
+        container: containerRef.current!,
+        style: getMapStyle(appliedStyle.current).url,
+        // Start zoomed out on the globe; the load handler flies in
+        center: [INITIAL_CENTER[0] - 40, INITIAL_CENTER[1] + 10],
+        zoom: 1.2,
+        maxPitch: 85,
+        attributionControl: { compact: true, customAttribution: FIRMS_ATTRIBUTION },
+      });
+    } catch (err) {
+      cb.current.onFail(err instanceof Error ? err.message : "WebGL unavailable");
+      return;
+    }
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right");
     mapRef.current = map;
 
-    map.on("load", () => {
-      map.setProjection({ type: "globe" });
-      map.setSky({
-        "sky-color": "#0b1222",
-        "horizon-color": "#1e293b",
-        "fog-color": "#0f172a",
-        "sky-horizon-blend": 0.6,
-        "horizon-fog-blend": 0.6,
-        "fog-ground-blend": 0.85,
-        "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 1, 8, 1, 11, 0],
-      });
+    map.on("webglcontextlost", () => cb.current.onFail("WebGL context lost"));
+    map.on("error", (e) => console.warn("[maplibre]", e.error?.message));
 
-      // Separate DEM sources for terrain and hillshade are recommended for performance
-      map.addSource("dem-terrain", {
-        type: "raster-dem", tiles: DEM_TILES, encoding: "terrarium",
-        tileSize: 256, maxzoom: 14, attribution: DEM_ATTRIBUTION,
-      });
-      map.addSource("dem-hillshade", {
-        type: "raster-dem", tiles: DEM_TILES, encoding: "terrarium", tileSize: 256, maxzoom: 14,
-      });
-      map.addLayer({
-        id: "hillshade",
-        type: "hillshade",
-        source: "dem-hillshade",
-        paint: {
-          "hillshade-exaggeration": 0.45,
-          "hillshade-shadow-color": "#000000",
-          "hillshade-highlight-color": "#ffffff",
-        },
-      });
-
-      map.addSource("areas", { type: "geojson", data: emptyFC() });
-      map.addLayer({
-        id: "areas-fill",
-        type: "fill",
-        source: "areas",
-        paint: {
-          "fill-color": ["case", ["get", "active"], "#38bdf8", "#94a3b8"],
-          "fill-opacity": ["case", ["get", "active"], 0.08, 0.03],
-        },
-      });
-      map.addLayer({
-        id: "areas-line",
-        type: "line",
-        source: "areas",
-        paint: {
-          "line-color": ["case", ["get", "active"], "#38bdf8", "#94a3b8"],
-          "line-width": ["case", ["get", "active"], 3, 1.5],
-        },
-      });
-
-      map.addSource("fires", { type: "geojson", data: emptyFC() });
-      map.addSource("fire-columns", { type: "geojson", data: emptyFC() });
-
-      // Heatmap for the zoomed-out overview, fading out as points take over
-      map.addLayer({
-        id: "fires-heat",
-        type: "heatmap",
-        source: "fires",
-        maxzoom: 9,
-        paint: {
-          "heatmap-weight": ["interpolate", ["linear"], ["get", "frp"], 0, 0.15, 50, 1],
-          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 0, 0.6, 8, 2],
-          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 0, 4, 5, 14, 8, 24],
-          "heatmap-color": [
-            "interpolate", ["linear"], ["heatmap-density"],
-            0, "rgba(0,0,0,0)",
-            0.2, "rgba(250,204,21,0.35)",
-            0.45, "rgba(249,115,22,0.6)",
-            0.75, "rgba(220,38,38,0.8)",
-            1, "rgba(254,242,242,0.95)",
-          ],
-          "heatmap-opacity": ["interpolate", ["linear"], ["zoom"], 6, 0.85, 9, 0],
-        },
-      });
-
-      map.addLayer({
-        id: "fire-columns",
-        type: "fill-extrusion",
-        source: "fire-columns",
-        minzoom: 3,
-        paint: {
-          "fill-extrusion-color": CONFIDENCE_COLOR,
-          "fill-extrusion-height": 0,
-          "fill-extrusion-opacity": 0.85,
-        },
-      });
-
-      // Expanding ring behind high-confidence detections (radius/opacity animated below)
-      map.addLayer({
-        id: "fires-pulse",
-        type: "circle",
-        source: "fires",
-        filter: ["==", ["get", "confidence"], "high"],
-        paint: {
-          "circle-color": "#ef4444",
-          "circle-radius": BASE_RADIUS,
-          "circle-opacity": 0,
-          "circle-blur": 0.4,
-        },
-      });
-
-      map.addLayer({
-        id: "fires",
-        type: "circle",
-        source: "fires",
-        paint: {
-          "circle-color": CONFIDENCE_COLOR,
-          "circle-radius": BASE_RADIUS,
-          "circle-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.45, 7, 0.85],
-          "circle-stroke-width": 1,
-          "circle-stroke-color": "#000",
-        },
-      });
-
-      for (const layer of ["fires", "fire-columns"]) {
-        map.on("click", layer, (e) => {
-          const raw = e.features?.[0]?.properties?.fire;
-          if (!raw) return;
-          const fire = JSON.parse(raw) as Fire;
-          cb.current.onFireClick(fire);
-          setOrbit(false);
-          map.flyTo({
-            center: [fire.lng, fire.lat],
-            zoom: Math.max(map.getZoom(), 10.5),
-            pitch: 62,
-            bearing: map.getBearing() + 35,
-            duration: 2600,
-            essential: true,
-          });
-        });
-        map.on("mouseenter", layer, () => (map.getCanvas().style.cursor = "pointer"));
-        map.on("mouseleave", layer, () => (map.getCanvas().style.cursor = ""));
-      }
-
-      // Any manual interaction cancels the orbit
-      for (const ev of ["mousedown", "touchstart", "wheel"] as const) {
-        map.on(ev, () => setOrbit(false));
-      }
-
+    // Fires for the initial style and again after every setStyle()
+    map.on("style.load", () => {
+      installOverlays(map, env.current);
       const draw = createTerraDraw(
         new TerraDrawMapLibreGLAdapter({ map }),
         (g) => cb.current.onAreaDrawn(g),
       );
       draw.start();
-      draw.setMode("static");
+      draw.setMode(cb.current.drawMode);
       drawRef.current = draw;
+      setStyleVersion((v) => v + 1);
+    });
 
-      // Intro flight; the first moveend (when it lands) triggers the initial scan
+    // Ready as soon as the first style is in and our layers are installed. (The `load` event
+    // also waits for every tile, which can take far longer on slow GPUs/networks.)
+    map.once("style.load", () => {
+      cb.current.onReady();
+      // The first moveend (when the intro flight lands) reports the viewport
       map.on("moveend", () => {
         const b = map.getBounds();
         cb.current.onViewportChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
       });
       map.flyTo({ ...HOME_CAMERA, duration: 4500, curve: 1.6, essential: true });
-      setReady(true);
     });
+
+    // Layer-scoped handlers survive style switches (matched by layer id at event time)
+    for (const layer of ["fw-fires", "fw-fire-columns"]) {
+      map.on("click", layer, (e) => {
+        const raw = e.features?.[0]?.properties?.fire;
+        if (!raw) return;
+        const fire = JSON.parse(raw) as Fire;
+        cb.current.onFireClick(fire);
+        setOrbit(false);
+        map.flyTo({
+          center: [fire.lng, fire.lat],
+          zoom: Math.max(map.getZoom(), 10.5),
+          pitch: 62,
+          bearing: map.getBearing() + 35,
+          duration: 2600,
+          essential: true,
+        });
+      });
+      map.on("mouseenter", layer, () => (map.getCanvas().style.cursor = "pointer"));
+      map.on("mouseleave", layer, () => (map.getCanvas().style.cursor = ""));
+    }
+
+    // Any manual interaction cancels the orbit
+    for (const ev of ["mousedown", "touchstart", "wheel"] as const) {
+      map.on(ev, () => setOrbit(false));
+    }
 
     return () => {
       drawRef.current?.stop();
@@ -244,45 +153,32 @@ export default function MapLibreMap(props: FireMapProps) {
     };
   }, []);
 
-  // Basemap swap — inserted beneath hillshade so all data layers stay on top
+  // Style switch: Terra Draw must unregister while its layers still exist; everything is
+  // re-installed in the style.load handler.
   useEffect(() => {
     const map = mapRef.current;
-    if (!ready || !map) return;
-    for (const layer of map.getStyle().layers) {
-      if (layer.id.startsWith(BASEMAP_PREFIX)) map.removeLayer(layer.id);
-    }
-    for (const id of Object.keys(map.getStyle().sources)) {
-      if (id.startsWith(BASEMAP_PREFIX)) map.removeSource(id);
-    }
-    const { layers, attribution } = getBasemap(basemap);
-    layers.forEach(({ url, maxZoom }, i) => {
-      const id = `${BASEMAP_PREFIX}${i}`;
-      map.addSource(id, {
-        type: "raster",
-        tiles: [url],
-        tileSize: 256,
-        maxzoom: maxZoom,
-        attribution: i === 0 ? attribution : undefined,
-      });
-      map.addLayer({ id, type: "raster", source: id }, "hillshade");
-    });
-  }, [basemap, ready]);
+    if (!ready || !map || appliedStyle.current === mapStyle) return;
+    appliedStyle.current = mapStyle;
+    drawRef.current?.stop();
+    drawRef.current = null;
+    map.setStyle(getMapStyle(mapStyle).url, { diff: false });
+  }, [mapStyle, ready]);
 
   useEffect(() => {
     if (ready) mapRef.current?.setProjection({ type: globe ? "globe" : "mercator" });
-  }, [globe, ready]);
+  }, [globe, ready, styleVersion]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!ready || !map) return;
-    map.setTerrain(terrain ? { source: "dem-terrain", exaggeration: 1.6 } : null);
-    map.setLayoutProperty("hillshade", "visibility", terrain ? "visible" : "none");
-  }, [terrain, ready]);
+    if (ready && mapRef.current) setTerrainEnabled(mapRef.current, terrain);
+  }, [terrain, ready, styleVersion]);
 
   useEffect(() => {
-    if (!ready) return;
-    mapRef.current?.setLayoutProperty("fire-columns", "visibility", columns ? "visible" : "none");
-  }, [columns, ready]);
+    if (ready) setVisible(mapRef.current, "fw-buildings", buildings);
+  }, [buildings, ready, styleVersion]);
+
+  useEffect(() => {
+    if (ready) setVisible(mapRef.current, "fw-fire-columns", columns);
+  }, [columns, ready, styleVersion]);
 
   // Pulse animation for high-confidence fires
   useEffect(() => {
@@ -290,9 +186,11 @@ export default function MapLibreMap(props: FireMapProps) {
     if (!ready || !map) return;
     let raf = 0;
     const tick = (now: number) => {
-      const t = (now % PULSE_MS) / PULSE_MS;
-      map.setPaintProperty("fires-pulse", "circle-radius", ["+", BASE_RADIUS, t * 16]);
-      map.setPaintProperty("fires-pulse", "circle-opacity", 0.55 * (1 - t));
+      if (map.getLayer("fw-fires-pulse")) {
+        const t = (now % PULSE_MS) / PULSE_MS;
+        map.setPaintProperty("fw-fires-pulse", "circle-radius", ["+", BASE_RADIUS, t * 16]);
+        map.setPaintProperty("fw-fires-pulse", "circle-opacity", 0.55 * (1 - t));
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -303,7 +201,7 @@ export default function MapLibreMap(props: FireMapProps) {
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map || !orbit) return;
-    if (map.getPitch() < 30) map.setPitch(50);
+    if (map.getPitch() < 30) map.setPitch(55);
     let raf = 0;
     let last = performance.now();
     const tick = (now: number) => {
@@ -347,20 +245,24 @@ export default function MapLibreMap(props: FireMapProps) {
         },
       })),
     };
-    map.getSource<GeoJSONSource>("fires")?.setData(points);
-    map.getSource<GeoJSONSource>("fire-columns")?.setData(cols);
+    map.getSource<GeoJSONSource>("fw-fires")?.setData(points);
+    map.getSource<GeoJSONSource>("fw-fire-columns")?.setData(cols);
 
     let raf = 0;
     const start = performance.now();
     const tick = (now: number) => {
       const p = Math.min(1, (now - start) / GROW_MS);
       const eased = 1 - Math.pow(1 - p, 3);
-      map.setPaintProperty("fire-columns", "fill-extrusion-height", ["*", ["get", "height"], eased]);
+      if (map.getLayer("fw-fire-columns")) {
+        map.setPaintProperty("fw-fire-columns", "fill-extrusion-height", [
+          "*", ["get", "height"], eased,
+        ]);
+      }
       if (p < 1) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [fires, ready]);
+  }, [fires, ready, styleVersion]);
 
   useEffect(() => {
     if (!ready) return;
@@ -372,8 +274,8 @@ export default function MapLibreMap(props: FireMapProps) {
         properties: { name: a.name, active: a.id === activeAreaId },
       })),
     };
-    mapRef.current?.getSource<GeoJSONSource>("areas")?.setData(fc);
-  }, [areas, activeAreaId, ready]);
+    mapRef.current?.getSource<GeoJSONSource>("fw-areas")?.setData(fc);
+  }, [areas, activeAreaId, ready, styleVersion]);
 
   useEffect(() => {
     if (!focus || !mapRef.current) return;
@@ -390,7 +292,8 @@ export default function MapLibreMap(props: FireMapProps) {
   const toggles = [
     { label: "Globe", icon: GlobeIcon, on: globe, set: setGlobe },
     { label: "Terrain", icon: MountainSnowIcon, on: terrain, set: setTerrain },
-    { label: "3D columns", icon: BoxIcon, on: columns, set: setColumns },
+    { label: "Buildings", icon: Building2Icon, on: buildings, set: setBuildings },
+    { label: "Fire columns", icon: BoxIcon, on: columns, set: setColumns },
     { label: "Orbit", icon: RotateCwIcon, on: orbit, set: setOrbit },
   ];
 
@@ -402,7 +305,7 @@ export default function MapLibreMap(props: FireMapProps) {
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.4 }}
-          className="absolute top-4 left-4 z-10 flex gap-1 rounded-xl border bg-card/80 p-1 backdrop-blur"
+          className="absolute top-4 left-4 z-10 flex flex-wrap gap-1 rounded-xl border bg-card/80 p-1 backdrop-blur"
         >
           {toggles.map(({ label, icon: Icon, on, set }) => (
             <Button
@@ -413,10 +316,12 @@ export default function MapLibreMap(props: FireMapProps) {
               disabled={label === "Orbit" && drawMode !== "static"}
               onClick={() => {
                 set((v) => !v);
-                // Tilt so relief is visible (done here, not in the effect, to avoid cancelling the intro flight)
+                // Tilt so relief / buildings are visible (here, not in an effect, so the
+                // intro flight is never cancelled)
                 const map = mapRef.current;
-                if (label === "Terrain" && !on && map && map.getPitch() < 30) {
-                  map.easeTo({ pitch: 50, duration: 1200 });
+                const wantsTilt = label === "Terrain" || label === "Buildings";
+                if (wantsTilt && !on && map && map.getPitch() < 30) {
+                  map.easeTo({ pitch: 55, duration: 1200 });
                 }
               }}
             >
@@ -440,6 +345,148 @@ export default function MapLibreMap(props: FireMapProps) {
       )}
     </div>
   );
+}
+
+// Adds terrain, lighting, sky, 3D buildings and all FireWatch data layers on top of the
+// current OpenFreeMap style. Called on every style.load.
+function installOverlays(
+  map: maplibregl.Map,
+  env: { globe: boolean; terrain: boolean; buildings: boolean; columns: boolean },
+) {
+  map.setProjection({ type: env.globe ? "globe" : "mercator" });
+  map.setSky({
+    "sky-color": "#7dd3fc",
+    "horizon-color": "#e0f2fe",
+    "fog-color": "#f1f5f9",
+    "sky-horizon-blend": 0.5,
+    "horizon-fog-blend": 0.4,
+    "fog-ground-blend": 0.95,
+    // Subtle halo on the globe; fades out as the camera gets close
+    "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 0.45, 6, 0.3, 10, 0],
+  });
+  // Low sun from the south-west so extrusions and relief get readable shading
+  map.setLight({ anchor: "map", color: "#fff7ed", intensity: 0.45, position: [1.5, 210, 35] });
+
+  addTerrainLayers(map);
+  setTerrainEnabled(map, env.terrain);
+
+  // Use our own building extrusion on every style (Liberty ships one; Bright/Positron don't)
+  const style = map.getStyle();
+  for (const layer of style.layers) {
+    if (layer.type === "fill-extrusion") map.setLayoutProperty(layer.id, "visibility", "none");
+  }
+  if (style.sources.openmaptiles) {
+    map.addLayer({
+      id: "fw-buildings",
+      type: "fill-extrusion",
+      source: "openmaptiles",
+      "source-layer": "building",
+      minzoom: 13,
+      layout: { visibility: env.buildings ? "visible" : "none" },
+      paint: {
+        "fill-extrusion-color": [
+          "interpolate", ["linear"], ["coalesce", ["get", "render_height"], 0],
+          0, "#e7e5e4", 50, "#d6d3d1", 150, "#a8a29e",
+        ],
+        "fill-extrusion-height": [
+          "interpolate", ["linear"], ["zoom"], 13, 0, 14.5, ["coalesce", ["get", "render_height"], 6],
+        ],
+        "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+        "fill-extrusion-opacity": 0.85,
+      },
+    });
+  }
+
+  map.addSource("fw-areas", { type: "geojson", data: emptyFC() });
+  map.addLayer({
+    id: "fw-areas-fill",
+    type: "fill",
+    source: "fw-areas",
+    paint: {
+      "fill-color": ["case", ["get", "active"], "#0284c7", "#64748b"],
+      "fill-opacity": ["case", ["get", "active"], 0.12, 0.05],
+    },
+  });
+  map.addLayer({
+    id: "fw-areas-line",
+    type: "line",
+    source: "fw-areas",
+    paint: {
+      "line-color": ["case", ["get", "active"], "#0284c7", "#64748b"],
+      "line-width": ["case", ["get", "active"], 3, 1.5],
+    },
+  });
+
+  map.addSource("fw-fires", { type: "geojson", data: emptyFC() });
+  map.addSource("fw-fire-columns", { type: "geojson", data: emptyFC() });
+
+  // Heatmap for the zoomed-out overview, fading out as points take over
+  map.addLayer({
+    id: "fw-fires-heat",
+    type: "heatmap",
+    source: "fw-fires",
+    maxzoom: 9,
+    paint: {
+      "heatmap-weight": ["interpolate", ["linear"], ["get", "frp"], 0, 0.15, 50, 1],
+      "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 0, 0.6, 8, 2],
+      "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 0, 4, 5, 14, 8, 24],
+      "heatmap-color": [
+        "interpolate", ["linear"], ["heatmap-density"],
+        0, "rgba(0,0,0,0)",
+        0.2, "rgba(250,204,21,0.35)",
+        0.45, "rgba(249,115,22,0.6)",
+        0.75, "rgba(220,38,38,0.8)",
+        1, "rgba(127,29,29,0.95)",
+      ],
+      "heatmap-opacity": ["interpolate", ["linear"], ["zoom"], 6, 0.8, 9, 0],
+    },
+  });
+
+  map.addLayer({
+    id: "fw-fire-columns",
+    type: "fill-extrusion",
+    source: "fw-fire-columns",
+    minzoom: 3,
+    layout: { visibility: env.columns ? "visible" : "none" },
+    paint: {
+      "fill-extrusion-color": CONFIDENCE_COLOR,
+      "fill-extrusion-height": 0,
+      "fill-extrusion-opacity": 0.85,
+    },
+  });
+
+  // Expanding ring behind high-confidence detections (radius/opacity animated in a rAF loop)
+  map.addLayer({
+    id: "fw-fires-pulse",
+    type: "circle",
+    source: "fw-fires",
+    filter: ["==", ["get", "confidence"], "high"],
+    paint: {
+      "circle-color": "#ef4444",
+      "circle-radius": BASE_RADIUS,
+      "circle-opacity": 0,
+      "circle-blur": 0.4,
+    },
+  });
+
+  map.addLayer({
+    id: "fw-fires",
+    type: "circle",
+    source: "fw-fires",
+    paint: {
+      "circle-color": CONFIDENCE_COLOR,
+      "circle-radius": BASE_RADIUS,
+      "circle-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.5, 7, 0.9],
+      "circle-stroke-width": 1,
+      "circle-stroke-color": "#ffffff",
+    },
+  });
+}
+
+function setVisible(map: maplibregl.Map | null, layerId: string, visible: boolean) {
+  if (map?.getLayer(layerId)) {
+    map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
+  }
 }
 
 function squareAround(lng: number, lat: number, halfDeg: number): Polygon {
