@@ -12,6 +12,7 @@
 import { FIRMS_SOURCES, type FirePoint } from "./gambut";
 
 const FIRMS_BASE = "https://firms.modaps.eosdis.nasa.gov/api/area/csv";
+const FIRMS_TIMEOUT_MS = 8_000;
 
 function normaliseConfidence(raw: string): FirePoint["confidence"] {
   const v = raw.trim().toLowerCase();
@@ -71,30 +72,38 @@ export async function fetchFirmsFires(
     FIRMS_SOURCES.map((source) =>
       fetch(`${FIRMS_BASE}/${key}/${source}/${area}/${days}`, {
         next: { revalidate: 900 },
+        signal: AbortSignal.timeout(FIRMS_TIMEOUT_MS),
       }),
     ),
   );
 
   const fires: FirePoint[] = [];
+  let reachable = 0;
   for (const result of results) {
     if (result.status !== "fulfilled" || !result.value.ok) continue;
     try {
       fires.push(...parseFirmsCsv(await result.value.text()));
+      reachable += 1;
     } catch {
       // Skip a malformed source; the others may still be good
     }
   }
-  return fires;
+  return reachable === 0 ? null : fires;
 }
 
-/** Merge detections from overlapping satellites (same point + minute). */
+/**
+ * Merge detections of the same spot. VIIRS pixels are ~375 m (about 0.003
+ * degrees), so a fire seen on several passes or by overlapping satellites
+ * shares one 3-decimal lat/lng key; the newest detection wins.
+ */
 export function dedupeFirmsFires(fires: FirePoint[]): FirePoint[] {
   const seen = new Set<string>();
   const unique: FirePoint[] = [];
   // Newest detections first
   const sorted = [...fires].sort((a, b) => b.acquiredAt.localeCompare(a.acquiredAt));
   for (const f of sorted) {
-    const key = `${f.lat.toFixed(3)}-${f.lng.toFixed(3)}-${f.acquiredAt.slice(0, 13)}`;
+    if (!Number.isFinite(f.lat) || !Number.isFinite(f.lng)) continue;
+    const key = `${f.lat.toFixed(3)}:${f.lng.toFixed(3)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(f);

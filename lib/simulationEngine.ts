@@ -33,7 +33,7 @@ import {
   polygon,
   union,
 } from "@turf/turf";
-import type { Feature, LineString, Polygon, Position } from "geojson";
+import type { Feature, FeatureCollection, LineString, Polygon, Position } from "geojson";
 import {
   BmkgVillages,
   windVectorDeg,
@@ -50,6 +50,9 @@ export const FIREBREAK_PREP_HOURS = 3; // ground crew preparation horizon
 export const FIREBREAK_BUFFER_M = 120; // safety buffer from the fire head
 export const DEFAULT_LATENCY_HOURS = 3; // satellite picture-to-arrival delay
 export const FORECAST_HOURS = [1, 3, 6, 9, 12] as const;
+
+/** Minimum wind arrow length so a slow fire still gets a readable arrow. */
+const WIND_ARROW_MIN_M = 250;
 
 /* ------------------------------------------------------------------ */
 /* Core rate formulas                                                  */
@@ -322,6 +325,7 @@ export function computeNearestVillage(
   satelliteAcquisitionTime?: string,
   peatlandInfo?: PeatlandZone,
   weather?: WeatherTelemetry,
+  knownHeadRate?: number,
 ): VillageThreat {
   const origin = point([originLng, originLat]);
   let best: (typeof BmkgVillages)[number] = BmkgVillages[0];
@@ -337,7 +341,9 @@ export function computeNearestVillage(
   const distanceMeters = Math.round(bestKm * 1000);
 
   let etaMinutes = Number.POSITIVE_INFINITY;
-  if (satelliteAcquisitionTime && peatlandInfo && weather) {
+  if (knownHeadRate !== undefined) {
+    etaMinutes = (distanceMeters / Math.max(knownHeadRate, 0.1)) * 60;
+  } else if (satelliteAcquisitionTime && peatlandInfo && weather) {
     const sim = simulateSpread(
       {
         originLat,
@@ -430,14 +436,78 @@ export function distanceToFireMeters(
   }) * 1000;
 }
 
-/** Spread rate (m/h) of the fire toward the volunteer, for the HUD readout. */
+/**
+ * Spread rate (m/h) of the fire toward the volunteer, for the HUD readout.
+ * The fire travels from its origin to the volunteer, so the bearing is
+ * origin -> volunteer (the reverse of the HUD compass bearing).
+ */
 export function spreadRateToward(
   volunteerLat: number,
   volunteerLng: number,
   incident: Pick<HotspotIncident, "originLat" | "originLng" | "weather" | "peatlandInfo">,
 ): number {
-  const brg = bearingToFire(volunteerLat, volunteerLng, incident.originLat, incident.originLng);
+  const brg = bearingToFire(incident.originLat, incident.originLng, volunteerLat, volunteerLng);
   const m = moistureRetardation(incident.weather.relativeHumidity);
   const wv = windVectorDeg(incident.weather.windDirectionDeg);
   return spreadRateAt(brg, incident.peatlandInfo.baseSpreadRateR0, m, wv, incident.weather.windSpeedKmh);
+}
+
+/** Polygon of an incident at a timeline hour (0 = nowcast; unknown hours snap to the last forecast). */
+export function stepPolygonFor(
+  incident: Pick<HotspotIncident, "nowcastPolygon" | "forecastPolygons">,
+  hourOffset: number,
+): TimeStepPolygon {
+  if (hourOffset === 0) return incident.nowcastPolygon;
+  return (
+    incident.forecastPolygons.find((p) => p.hourOffset === hourOffset) ??
+    incident.forecastPolygons[incident.forecastPolygons.length - 1] ??
+    incident.nowcastPolygon
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Wind arrow                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Wind-push arrow anchored on the fire origin and pointing the way the wind
+ * drives the head fire: a shaft (LineString) plus a triangular head (Polygon),
+ * tagged by `properties.part`. Length follows the head-fire reach so the tip
+ * pokes out of the burn polygon.
+ */
+export function windArrowGeometry(
+  originLat: number,
+  originLng: number,
+  windVector: number,
+  reachM: number,
+): FeatureCollection<LineString | Polygon, { part: "shaft" | "head" }> {
+  const lengthM = Math.max(reachM * 1.25, WIND_ARROW_MIN_M);
+  const headM = Math.max(lengthM * 0.16, 60);
+  const from = point([originLng, originLat]);
+  const tip = destination(from, lengthM / 1000, windVector, { units: "kilometers" });
+  const baseLeft = destination(tip, headM / 1000, (windVector + 150) % 360, {
+    units: "kilometers",
+  });
+  const baseRight = destination(tip, headM / 1000, (windVector + 210) % 360, {
+    units: "kilometers",
+  });
+  const tipXY = tip.geometry.coordinates;
+  const leftXY = baseLeft.geometry.coordinates;
+  const rightXY = baseRight.geometry.coordinates;
+
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { part: "shaft" },
+        geometry: { type: "LineString", coordinates: [[originLng, originLat], tipXY] },
+      },
+      {
+        type: "Feature",
+        properties: { part: "head" },
+        geometry: { type: "Polygon", coordinates: [[tipXY, leftXY, rightXY, tipXY]] },
+      },
+    ],
+  };
 }
