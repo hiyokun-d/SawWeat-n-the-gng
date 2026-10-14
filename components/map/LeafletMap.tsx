@@ -3,12 +3,14 @@
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { useEffect, useRef } from "react";
-import { FIRE_STATUS_COLOR, type HotspotIncident } from "@/lib/gambut";
-import { firebreakLineString } from "@/lib/simulationEngine";
+import { BmkgVillages, FIRE_STATUS_COLOR, windVectorDeg } from "@/lib/gambut";
+import { firebreakLineString, stepPolygonFor, windArrowGeometry } from "@/lib/simulationEngine";
 import { OSM_TILES } from "@/lib/basemaps";
 import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
-import { BmkgVillages } from "@/lib/gambut";
 import { KUBU_RAYA_CENTER, KUBU_RAYA_ZOOM, type GambutMapProps } from "./types";
+
+// Same sky blue as the MapLibre wind arrow
+const WIND_COLOR = "#0284c7";
 
 /**
  * Leaflet fallback engine: raster OSM tiles, no WebGL.
@@ -20,6 +22,8 @@ export default function LeafletMap(props: GambutMapProps) {
   const khgLayer = useRef<L.GeoJSON | null>(null);
   const incidentLayers = useRef<L.LayerGroup | null>(null);
   const villageLayer = useRef<L.LayerGroup | null>(null);
+  // Re-centering on every slider tick makes the map jump; only follow selection changes
+  const centeredOn = useRef<string | null>(null);
 
   // Latest props without re-creating the map
   const cb = useRef(props);
@@ -35,7 +39,7 @@ export default function LeafletMap(props: GambutMapProps) {
     L.control.zoom({ position: "bottomright" }).addTo(map);
     L.tileLayer(OSM_TILES.url, {
       maxZoom: OSM_TILES.maxZoom,
-      attribution: `${OSM_TILES.attribution} | Data cuaca: BMKG`,
+      attribution: `${OSM_TILES.attribution} | Data cuaca: Open-Meteo / BMKG`,
     }).addTo(map);
 
     // KHG peatland hydrology unit polygon (context layer)
@@ -91,49 +95,45 @@ export default function LeafletMap(props: GambutMapProps) {
     const { incidents, selectedId, hourOffset } = cb.current;
     const selected = incidents.find((i) => i.id === selectedId) ?? incidents[0] ?? null;
 
-    for (const incident of incidents) {
+    // Burn polygons of every live incident at the timeline hour (extinguished fires stop
+    // simulating); the selected one is added last so it draws on top.
+    const live = incidents.filter((i) => i.status !== "EXTINGUISHED");
+    const ordered = [
+      ...live.filter((i) => i.id !== selected?.id),
+      ...live.filter((i) => i.id === selected?.id),
+    ];
+    for (const incident of ordered) {
       const isSelected = incident.id === selected?.id;
-      const statusColor = FIRE_STATUS_COLOR[incident.status];
-      const smoldering =
-        incident.status === "SUSPECTED_SMOLDERING" ||
-        incident.status === "CONFIRMED_SMOLDERING";
+      const smoldering = isSmoldering(incident.status);
+      L.geoJSON(stepPolygonFor(incident, hourOffset).geojsonPolygon as GeoJSON.GeoJsonObject, {
+        interactive: false,
+        style: {
+          color: smoldering ? "#fb923c" : "#ef4444",
+          weight: isSelected ? 2.5 : 1.25,
+          dashArray: "3 3",
+          fillColor: smoldering ? "#f97316" : "#dc2626",
+          fillOpacity: isSelected ? 0.35 : 0.2,
+          className: smoldering ? "smolder-blink" : undefined,
+        },
+      }).addTo(layer);
 
-      L.circleMarker([incident.originLat, incident.originLng], {
-        radius: isSelected ? 8 : 5,
-        color: statusColor,
-        fillColor: statusColor,
-        fillOpacity: 1,
-        weight: 2,
-        className: smoldering ? "smolder-blink" : undefined,
-      })
-        .bindTooltip(`${incident.id} · FRP ${incident.frpMegawatt} MW`, { sticky: true })
-        .on("click", () => cb.current.onSelectIncident(incident.id))
-        .addTo(layer);
-
-      if (!isSelected) continue;
-
-      const step =
-        hourOffset === 0
-          ? incident.nowcastPolygon
-          : incident.forecastPolygons.find((p) => p.hourOffset === hourOffset) ??
-            incident.forecastPolygons[incident.forecastPolygons.length - 1];
-
-      if (step) {
-        L.geoJSON(step.geojsonPolygon as GeoJSON.GeoJsonObject, {
+      // Nowcast stays visible as a dimmer base while a forecast hour is selected
+      if (isSelected && hourOffset > 0) {
+        L.geoJSON(incident.nowcastPolygon.geojsonPolygon as GeoJSON.GeoJsonObject, {
           interactive: false,
           style: {
             color: smoldering ? "#fb923c" : "#ef4444",
-            weight: 2,
+            weight: 1.25,
             dashArray: "3 3",
             fillColor: smoldering ? "#f97316" : "#dc2626",
-            fillOpacity: 0.35,
-            className: smoldering ? "smolder-blink" : undefined,
+            fillOpacity: 0.2,
           },
         }).addTo(layer);
       }
+    }
 
-      const fb = firebreakLineString(incident.firebreak);
-      L.geoJSON(fb as GeoJSON.GeoJsonObject, {
+    if (selected && selected.status !== "EXTINGUISHED") {
+      L.geoJSON(firebreakLineString(selected.firebreak) as GeoJSON.GeoJsonObject, {
         interactive: false,
         style: {
           color: "#facc15",
@@ -144,10 +144,51 @@ export default function LeafletMap(props: GambutMapProps) {
       })
         .bindTooltip("REKOMENDASI SEKAT BAKAR (POTONG DI SINI)", { sticky: true })
         .addTo(layer);
+
     }
 
-    // Fit the selected incident into view
-    if (selected) {
+    for (const incident of live) {
+      const isSelected = incident.id === selected?.id;
+      const arrow = windArrowGeometry(
+        incident.originLat,
+        incident.originLng,
+        windVectorDeg(incident.weather.windDirectionDeg),
+        stepPolygonFor(incident, hourOffset).maxSpreadRadiusM,
+      );
+      L.geoJSON(arrow as GeoJSON.GeoJsonObject, {
+        interactive: false,
+        filter: (f) => f.properties?.part === "shaft",
+        style: { color: "#ffffff", weight: isSelected ? 8 : 4.5, opacity: 0.85, lineCap: "round" },
+      }).addTo(layer);
+      L.geoJSON(arrow as GeoJSON.GeoJsonObject, {
+        interactive: false,
+        style: (f) =>
+          f?.properties?.part === "shaft"
+            ? { color: WIND_COLOR, weight: isSelected ? 4 : 2, lineCap: "round" }
+            : { color: "#ffffff", weight: 1, fillColor: WIND_COLOR, fillOpacity: 1 },
+      }).addTo(layer);
+    }
+
+    // Markers last so every point stays clickable above the polygons
+    for (const incident of incidents) {
+      const isSelected = incident.id === selected?.id;
+      const statusColor = FIRE_STATUS_COLOR[incident.status];
+      L.circleMarker([incident.originLat, incident.originLng], {
+        radius: isSelected ? 8 : 5,
+        color: statusColor,
+        fillColor: statusColor,
+        fillOpacity: 1,
+        weight: 2,
+        className: isSmoldering(incident.status) ? "smolder-blink" : undefined,
+      })
+        .bindTooltip(`${incident.id} · FRP ${incident.frpMegawatt} MW`, { sticky: true })
+        .on("click", () => cb.current.onSelectIncident(incident.id))
+        .addTo(layer);
+    }
+
+    // Follow the selection, not the timeline
+    if (selected && centeredOn.current !== selected.id) {
+      centeredOn.current = selected.id;
       map.setView([selected.originLat, selected.originLng], Math.max(map.getZoom(), 12), {
         animate: true,
       });
@@ -155,4 +196,8 @@ export default function LeafletMap(props: GambutMapProps) {
   }, [props.incidents, props.selectedId, props.hourOffset]);
 
   return <div ref={containerRef} className="h-full w-full bg-slate-950" />;
+}
+
+function isSmoldering(status: string): boolean {
+  return status === "SUSPECTED_SMOLDERING" || status === "CONFIRMED_SMOLDERING";
 }
