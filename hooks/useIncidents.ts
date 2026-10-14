@@ -12,6 +12,7 @@ import {
   type FireStatus,
   type FirePoint,
   type HotspotIncident,
+  type WeatherSource,
   type WeatherTelemetry,
 } from "@/lib/gambut";
 import {
@@ -49,13 +50,23 @@ export interface MaritimeConditions {
 
 type StatusMap = Record<string, { status: FireStatus; verifiedBy?: string; verifiedAt?: string }>;
 
-function buildIncident(
-  seed: SeedIncident,
-  weather: WeatherTelemetry,
-  status: FireStatus,
-  verifiedBy?: string,
-  verifiedAt?: string,
-): HotspotIncident {
+type IncidentGeometry = Pick<
+  HotspotIncident,
+  "nowcastPolygon" | "forecastPolygons" | "firebreak" | "nearestVillage"
+>;
+
+// Polygons only depend on the seed and the weather, not on the verification
+// status, so a status change (HUD button, demo scenario) reuses them.
+const geometryCache = new WeakMap<
+  SeedIncident,
+  { weather: WeatherTelemetry; geometry: IncidentGeometry }
+>();
+
+function incidentGeometry(seed: SeedIncident, weather: WeatherTelemetry): IncidentGeometry {
+  const cached = geometryCache.get(seed);
+  if (cached && cached.weather === weather) return cached.geometry;
+
+  const now = new Date();
   const simInput = {
     originLat: seed.originLat,
     originLng: seed.originLng,
@@ -63,10 +74,10 @@ function buildIncident(
     weather,
     peatlandInfo: seed.peatlandInfo,
   };
-  const sim = simulateSpread(simInput);
+  const sim = simulateSpread(simInput, now);
 
   // Re-anchored polygon from a satellite-update demo (scenario 1)
-  const nowcast = seed.mergedNowcast
+  const nowcastPolygon = seed.mergedNowcast
     ? {
         ...sim.nowcastPolygon,
         geojsonPolygon: seed.mergedNowcast,
@@ -75,26 +86,41 @@ function buildIncident(
     : sim.nowcastPolygon;
 
   // Widened buffer pushes the firebreak farther ahead after re-anchoring
-  const firebreak = computeFirebreak(simInput, new Date(), seed.mergedNowcast ? { bufferM: 300 } : undefined);
+  const firebreak = computeFirebreak(simInput, now, seed.mergedNowcast ? { bufferM: 300 } : undefined);
 
   const nearestVillage = computeNearestVillage(
     seed.originLat,
     seed.originLng,
     weather.windDirectionDeg,
-    new Date(),
+    now,
     seed.satelliteAcquisitionTime,
     seed.peatlandInfo,
     weather,
+    sim.headRate,
   );
 
+  const geometry: IncidentGeometry = {
+    nowcastPolygon,
+    forecastPolygons: sim.forecastPolygons,
+    firebreak,
+    nearestVillage,
+  };
+  geometryCache.set(seed, { weather, geometry });
+  return geometry;
+}
+
+function buildIncident(
+  seed: SeedIncident,
+  weather: WeatherTelemetry,
+  status: FireStatus,
+  verifiedBy?: string,
+  verifiedAt?: string,
+): HotspotIncident {
   return {
     ...seed,
     status,
     weather,
-    nowcastPolygon: nowcast,
-    forecastPolygons: sim.forecastPolygons,
-    firebreak,
-    nearestVillage,
+    ...incidentGeometry(seed, weather),
     lastVerifiedBy: verifiedBy,
     lastVerifiedAt: verifiedAt,
   };
@@ -103,6 +129,8 @@ function buildIncident(
 export interface UseIncidentsResult {
   incidents: HotspotIncident[];
   weather: WeatherTelemetry | null;
+  /** Provider that supplied `weather` (attribution is required for both). */
+  weatherSource: WeatherSource | null;
   maritime: MaritimeConditions | null;
   weatherError: string | null;
   weatherLoading: boolean;
@@ -124,6 +152,7 @@ export function useIncidents(): UseIncidentsResult {
   const [seeds, setSeeds] = useState<SeedIncident[]>([]);
   const [statuses, setStatuses] = useState<StatusMap>({});
   const [weather, setWeather] = useState<WeatherTelemetry | null>(null);
+  const [weatherSource, setWeatherSource] = useState<WeatherSource | null>(null);
   const [maritime, setMaritime] = useState<MaritimeConditions | null>(null);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
@@ -138,12 +167,14 @@ export function useIncidents(): UseIncidentsResult {
   seedsRef.current = seeds;
   const weatherRef = useRef(weather);
   weatherRef.current = weather;
+  const firePointsRef = useRef(firePoints);
+  firePointsRef.current = firePoints;
 
   useEffect(() => {
     setSeeds(createSeedIncidents());
   }, []);
 
-  /* ---------------- weather (BMKG prakiraan-cuaca) ---------------- */
+  /* ---------------- weather (Open-Meteo, BMKG fallback) ---------------- */
 
   const loadWeather = useCallback(async () => {
     setWeatherLoading(true);
@@ -155,15 +186,16 @@ export function useIncidents(): UseIncidentsResult {
         const errorMessage =
           typeof json === "object" && json !== null && "error" in json
             ? String((json as { error: unknown }).error)
-            : "Respons cuaca BMKG tidak dikenali";
+            : "Respons cuaca tidak dikenali";
         setWeatherError(errorMessage);
         return;
       }
       setWeather(parsed.data.telemetry);
+      setWeatherSource(parsed.data.source);
       setWeatherError(null);
       publishSync({ type: "weather:telemetry", telemetry: parsed.data.telemetry });
     } catch (err) {
-      setWeatherError(err instanceof Error ? err.message : "Gagal memuat cuaca BMKG");
+      setWeatherError(err instanceof Error ? err.message : "Gagal memuat data cuaca");
     } finally {
       setWeatherLoading(false);
     }
@@ -201,11 +233,19 @@ export function useIncidents(): UseIncidentsResult {
       const json: unknown = await res.json();
       const parsed = FirmsApiResponseSchema.safeParse(json);
       if (!parsed.success) return;
+      const failed =
+        parsed.data.configured && parsed.data.fires.length === 0 && Boolean(parsed.data.reason);
+      // A failed refresh keeps the detections (and notice) already on screen
+      if (failed && firePointsRef.current.length > 0) return;
       setFirmsConfigured(parsed.data.configured);
       setFirePoints(parsed.data.fires);
       if (parsed.data.configured && parsed.data.fires.length > 0) {
         setSatelliteNotice(
           `${parsed.data.fires.length} titik api terdeteksi NASA FIRMS (VIIRS near-real-time) di area KHG. Skenario simulasi dimatikan.`,
+        );
+      } else if (parsed.data.configured && parsed.data.reason) {
+        setSatelliteNotice(
+          `${parsed.data.reason}. Menampilkan skenario simulasi sampai data satelit bisa dimuat ulang.`,
         );
       } else if (parsed.data.configured) {
         setSatelliteNotice(
@@ -225,11 +265,16 @@ export function useIncidents(): UseIncidentsResult {
     void loadWeather();
     void loadMaritime();
     void loadFirms();
-    const interval = window.setInterval(() => {
+    const weatherTimer = window.setInterval(() => {
       void loadWeather();
       void loadMaritime();
     }, 5 * 60_000);
-    return () => window.clearInterval(interval);
+    // VIIRS passes arrive a few times a day; the proxy caches for 15 minutes
+    const firmsTimer = window.setInterval(() => void loadFirms(), 15 * 60_000);
+    return () => {
+      window.clearInterval(weatherTimer);
+      window.clearInterval(firmsTimer);
+    };
   }, [loadWeather, loadMaritime, loadFirms]);
 
   /* ---------------- hydrate persisted statuses ---------------- */
@@ -271,13 +316,17 @@ export function useIncidents(): UseIncidentsResult {
 
   /* ---------------- incidents (engine) ---------------- */
 
-  // Real FIRMS detections take priority; seed scenario is the fallback
   const realSeeds = useMemo(
     () => firePoints.map(firePointToSeed),
     [firePoints],
   );
   const usingFirms = firmsConfigured && realSeeds.length > 0;
-  const effectiveSeeds = usingFirms ? realSeeds : seeds;
+  const effectiveSeeds = useMemo(() => {
+    if (!usingFirms) return seeds;
+    const seedIds = new Set(seeds.map((s) => s.id));
+    const nonCollidingReal = realSeeds.filter((r) => !seedIds.has(r.id));
+    return [...seeds, ...nonCollidingReal];
+  }, [usingFirms, seeds, realSeeds]);
 
   const incidents = useMemo(() => {
     return effectiveSeeds.map((seed) => {
@@ -392,6 +441,7 @@ export function useIncidents(): UseIncidentsResult {
   return {
     incidents,
     weather,
+    weatherSource,
     maritime,
     weatherError,
     weatherLoading,

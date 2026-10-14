@@ -8,6 +8,7 @@ import {
   ExternalLinkIcon,
   FlameIcon,
   MapPinIcon,
+  NavigationIcon,
   RadioIcon,
   SatelliteIcon,
   ShieldAlertIcon,
@@ -278,6 +279,31 @@ export default function DashboardPage() {
             )}
           </AnimatePresence>
 
+          {/* Wind direction & telemetry widget overlay */}
+          {weather && (
+            <motion.div
+              initial={{ opacity: 0, y: -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.4 }}
+              className="pointer-events-none absolute top-3 right-3 z-10 hidden items-center gap-2.5 rounded-xl border border-white/10 bg-slate-950/85 px-3 py-2 text-xs shadow-lg backdrop-blur sm:flex"
+            >
+              <div className="flex size-7 shrink-0 items-center justify-center rounded-full border border-sky-400/40 bg-sky-500/10">
+                <NavigationIcon
+                  className="size-4 text-sky-400 transition-transform duration-300"
+                  style={{ transform: `rotate(${weather.windVectorDeg}deg)` }}
+                />
+              </div>
+              <div className="flex flex-col text-[11px] leading-tight">
+                <span className="font-semibold text-slate-200">
+                  Dorongan Angin: {compassName(weather.windVectorDeg)} ({Math.round(weather.windVectorDeg)}°)
+                </span>
+                <span className="text-slate-400">
+                  {Math.round(weather.windSpeedKmh)} km/jam · RH {Math.round(weather.relativeHumidity)}% · {Math.round(weather.temperatureC)}°C
+                </span>
+              </div>
+            </motion.div>
+          )}
+
           {/* Legend */}
           <motion.div
             initial={{ opacity: 0 }}
@@ -301,6 +327,10 @@ export default function DashboardPage() {
             <div className="flex items-center gap-1.5">
               <span className="inline-block h-0.5 w-5 border-t-2 border-dashed border-yellow-400" />
               Rekomendasi sekat bakar
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="inline-block h-0.5 w-5 bg-sky-500" />
+              Vektor dorongan angin &amp; kepala api
             </div>
             <div className="flex items-center gap-1.5">
               <span className="inline-block h-2.5 w-4 rounded-sm border border-lime-700 bg-[#1a2e05]/40" />
@@ -408,10 +438,15 @@ function SidebarContent({
                     unit="km/jam"
                   />
                   <Metric
-                    icon={<MapPinIcon className="size-3.5" />}
-                    label="Push"
-                    value={`${Math.round(weather.windDirectionDeg)}°`}
-                    unit="derajat"
+                    icon={
+                      <NavigationIcon
+                        className="size-3.5 text-sky-400 transition-transform duration-300"
+                        style={{ transform: `rotate(${weather.windVectorDeg}deg)` }}
+                      />
+                    }
+                    label="Dorongan"
+                    value={`${compassName(weather.windVectorDeg)}`}
+                    unit={`${Math.round(weather.windVectorDeg)}°`}
                   />
                   <Metric
                     icon={<ThermometerIcon className="size-3.5" />}
@@ -621,6 +656,7 @@ function IncidentCard({
 }
 
 function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hourOffset: number }) {
+  const [apiBrief, setApiBrief] = useState<string | null>(null);
   const step =
     hourOffset === 0
       ? incident.nowcastPolygon
@@ -633,6 +669,53 @@ function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hour
   const smoldering =
     incident.status === "SUSPECTED_SMOLDERING" || incident.status === "CONFIRMED_SMOLDERING";
 
+  useEffect(() => {
+    let active = true;
+    const center = fb.coordinates[2] ?? fb.coordinates[0];
+    const payload = {
+      incidentId: incident.id,
+      status: incident.status,
+      telemetry: {
+        windSpeedKmh: incident.weather.windSpeedKmh,
+        windDirectionDeg: incident.weather.windDirectionDeg,
+        windVectorDeg: incident.weather.windVectorDeg,
+        relativeHumidity: incident.weather.relativeHumidity,
+        temperatureC: incident.weather.temperatureC,
+      },
+      firebreak: {
+        lengthMeters: fb.lengthMeters,
+        etaFireArrivalMinutes: fb.etaFireArrivalMinutes,
+        centerLat: center[0],
+        centerLng: center[1],
+      },
+      nearestVillage: {
+        name: village.name,
+        distanceMeters: village.distanceMeters,
+        threatLevel: village.threatLevel,
+        safeEvacuationBearingDeg: village.safeEvacuationBearingDeg,
+      },
+      headFireRate: incident.peatlandInfo.baseSpreadRateR0 * 1.5,
+      burnedAreaHa: step.burnedAreaHa,
+    };
+
+    fetch("/api/tactical-brief", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+      .then((res) => res.json())
+      .then((data: { ok?: boolean; brief?: string }) => {
+        if (active && data.ok && data.brief) {
+          setApiBrief(data.brief);
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, [incident, hourOffset, fb, village, step.burnedAreaHa]);
+
   return (
     <motion.div
       key={`${incident.id}-${hourOffset}-${incident.status}`}
@@ -641,39 +724,49 @@ function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hour
       transition={{ duration: 0.25, ease: "easeOut" }}
       className="rounded-lg border border-white/10 bg-slate-950/70 p-3"
     >
-      <div className="mb-2 flex items-center gap-1.5">
-        <ShieldAlertIcon className="size-4 text-orange-400" />
-        <span className="text-xs font-bold">AI TACTICAL BRIEFING</span>
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <ShieldAlertIcon className="size-4 text-orange-400" />
+          <span className="text-xs font-bold">AI TACTICAL BRIEFING</span>
+        </div>
+        <Badge variant="outline" className="border-orange-500/30 text-[10px] text-orange-300">
+          SOP BPBD
+        </Badge>
       </div>
       <div className="space-y-1.5 text-xs leading-relaxed">
-        <p>
-          <span className="font-semibold">Status:</span> {FIRE_STATUS_LABEL[incident.status]} ·
-          ancaman ke <span className="font-semibold">{village.name}</span>{" "}
-          <span style={{ color: THREAT_COLOR[village.threatLevel] }}>
-            {THREAT_LABEL[village.threatLevel]}
-          </span>{" "}
-          (jarak {Math.round(village.distanceMeters)} m).
-        </p>
-        <p>
-          <span className="font-semibold">Kondisi:</span> angin {incident.weather.windSpeedKmh}{" "}
-          km/jam dari {compassName(incident.weather.windDirectionDeg)}, kelembapan{" "}
-          {Math.round(incident.weather.relativeHumidity)}%
-          {smoldering ? " (titik panas tertutup asap: curigai bara bawah tanah)" : ""}. Estimasi
-          api tiba di desa <span className="font-semibold">{fb.etaFireArrivalMinutes} menit</span>.
-        </p>
-        <p>
-          <span className="font-semibold">Instruksi:</span> kerahkan {crew} regu MPA untuk memotong
-          jalur sekat bakar sepanjang {Math.round(fb.lengthMeters)} m di garis kuning peta,
-          tuntas sebelum pukul {wibTime(deadlineIso)}. Setelah memotong, batu-bata api yang
-          tersapu harus dipastikan padam.
-        </p>
-        <p>
-          <span className="font-semibold">Luas terancam:</span> {step.burnedAreaHa.toFixed(1)} ha
-          pada t+{hourOffset} jam.
-        </p>
+        {apiBrief ? (
+          <p className="text-slate-200">{apiBrief}</p>
+        ) : (
+          <>
+            <p>
+              <span className="font-semibold">Status:</span> {FIRE_STATUS_LABEL[incident.status]} ·
+              ancaman ke <span className="font-semibold">{village.name}</span>{" "}
+              <span style={{ color: THREAT_COLOR[village.threatLevel] }}>
+                {THREAT_LABEL[village.threatLevel]}
+              </span>{" "}
+              (jarak {Math.round(village.distanceMeters)} m).
+            </p>
+            <p>
+              <span className="font-semibold">Kondisi:</span> angin {incident.weather.windSpeedKmh}{" "}
+              km/jam dari {compassName(incident.weather.windDirectionDeg)}, kelembapan{" "}
+              {Math.round(incident.weather.relativeHumidity)}%
+              {smoldering ? " (titik panas tertutup asap: curigai bara bawah tanah)" : ""}. Estimasi
+              api tiba di desa <span className="font-semibold">{fb.etaFireArrivalMinutes} menit</span>.
+            </p>
+            <p>
+              <span className="font-semibold">Instruksi:</span> kerahkan {crew} regu MPA untuk memotong
+              jalur sekat bakar sepanjang {Math.round(fb.lengthMeters)} m di garis kuning peta,
+              tuntas sebelum pukul {wibTime(deadlineIso)}.
+            </p>
+            <p>
+              <span className="font-semibold">Luas terancam:</span> {step.burnedAreaHa.toFixed(1)} ha
+              pada t+{hourOffset} jam.
+            </p>
+          </>
+        )}
       </div>
       <p className="mt-2 text-[10px] text-muted-foreground">
-        Sumber data: BMKG. Briefing digenerate otomatis, verifikasi lapangan tetap wajib.
+        Sumber data: BMKG &amp; Algoritma Perambatan Gambut. Verifikasi lapangan tetap wajib.
       </p>
     </motion.div>
   );

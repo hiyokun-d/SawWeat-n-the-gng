@@ -16,11 +16,10 @@ import { motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { BMKG_ATTRIBUTION, getMapStyle } from "@/lib/basemaps";
-import { FIRE_STATUS_COLOR, type HotspotIncident } from "@/lib/gambut";
+import { BmkgVillages, FIRE_STATUS_COLOR, windVectorDeg } from "@/lib/gambut";
 import { addTerrainLayers, setTerrainEnabled } from "@/lib/terrain";
-import { firebreakLineString } from "@/lib/simulationEngine";
+import { firebreakLineString, stepPolygonFor, windArrowGeometry } from "@/lib/simulationEngine";
 import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
-import { BmkgVillages } from "@/lib/gambut";
 import { KUBU_RAYA_CENTER, KUBU_RAYA_ZOOM, type GambutMapProps } from "./types";
 
 // MapLibre derives its worker URL from import.meta.url, which is not an http URL once
@@ -66,6 +65,23 @@ const BURN_COLOR: maplibregl.ExpressionSpecification = [
   "#22c55e",
   "#dc2626",
 ];
+
+// Wind-push arrow: sky blue is not used by any fire status, so it never reads as a fire state.
+const WIND_COLOR = "#0284c7";
+
+/** Burn fill opacity: selected incident stronger, forecast softer, smoldering blinks. */
+function burnOpacity(smolderOpacity: number): maplibregl.ExpressionSpecification {
+  return [
+    "case",
+    ["get", "smolder"],
+    smolderOpacity,
+    ["get", "isForecast"],
+    0.22,
+    ["get", "selected"],
+    0.35,
+    0.2,
+  ];
+}
 
 const BASE_RADIUS: maplibregl.ExpressionSpecification = [
   "interpolate",
@@ -146,9 +162,9 @@ export default function MapLibreMap(props: MapLibreMapProps) {
 
     // Incident clicks (layer-scoped handlers survive style switches)
     map.on("click", "gw-incidents", (e) => {
-      const raw = e.features?.[0]?.properties?.incident;
-      if (!raw) return;
-      const incident = JSON.parse(raw) as HotspotIncident;
+      const id: unknown = e.features?.[0]?.properties?.id;
+      const incident = cb.current.incidents.find((i) => i.id === id);
+      if (!incident) return;
       cb.current.onSelectIncident(incident.id);
       setOrbit(false);
       map.flyTo({
@@ -212,7 +228,7 @@ export default function MapLibreMap(props: MapLibreMapProps) {
           frp: i.frpMegawatt,
           active:
             i.status === "CONFIRMED_FLAMING" || i.status === "UNVERIFIED_HOTSPOT",
-          incident: JSON.stringify(i),
+          id: i.id,
         },
       })),
     };
@@ -248,42 +264,70 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     return () => cancelAnimationFrame(raf);
   }, [incidents, ready, styleVersion]);
 
-  // Burn polygons (nowcast + forecast of the selected incident) and the firebreak line
+  // Every live incident's polygon at the timeline hour; the selected one also gets
+  // its nowcast base, the wind-push arrow and the firebreak line.
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map) return;
     const selected = incidents.find((i) => i.id === selectedId) ?? incidents[0];
     const burn: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
 
-    if (selected) {
-      const step =
-        hourOffset === 0
-          ? selected.nowcastPolygon
-          : selected.forecastPolygons.find((p) => p.hourOffset === hourOffset) ??
-            selected.forecastPolygons[selected.forecastPolygons.length - 1];
-
-      if (step) {
-        burn.features.push({
-          ...step.geojsonPolygon,
-          properties: { status: selected.status, isForecast: hourOffset > 0 },
-        });
-      }
-      // Nowcast stays visible as a dimmer base while a forecast hour is selected
-      if (hourOffset > 0) {
-        burn.features.push({
-          ...selected.nowcastPolygon.geojsonPolygon,
-          properties: { status: selected.status, isForecast: false },
-        });
-      }
-
-      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(firebreakLineString(selected.firebreak));
-    } else {
-      map.getSource<GeoJSONSource>("gw-firebreak")?.setData({
-        type: "FeatureCollection",
-        features: [],
+    // Extinguished fires stop simulating (prd.md); the selected one is drawn last, on top
+    const live = incidents.filter((i) => i.status !== "EXTINGUISHED");
+    const ordered = [
+      ...live.filter((i) => i.id !== selected?.id),
+      ...live.filter((i) => i.id === selected?.id),
+    ];
+    for (const incident of ordered) {
+      const isSelected = incident.id === selected?.id;
+      const props = {
+        id: incident.id,
+        status: incident.status,
+        selected: isSelected,
+        smolder:
+          incident.status === "SUSPECTED_SMOLDERING" || incident.status === "CONFIRMED_SMOLDERING",
+      };
+      burn.features.push({
+        ...stepPolygonFor(incident, hourOffset).geojsonPolygon,
+        properties: { ...props, isForecast: hourOffset > 0 },
       });
+      // Nowcast stays visible as a dimmer base while a forecast hour is selected
+      if (isSelected && hourOffset > 0) {
+        burn.features.push({
+          ...incident.nowcastPolygon.geojsonPolygon,
+          properties: { ...props, isForecast: false },
+        });
+      }
     }
     map.getSource<GeoJSONSource>("gw-burn")?.setData(burn);
+
+    const windArrows: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
+    for (const incident of live) {
+      const isSelected = incident.id === selected?.id;
+      const step = stepPolygonFor(incident, hourOffset);
+      const arrow = windArrowGeometry(
+        incident.originLat,
+        incident.originLng,
+        windVectorDeg(incident.weather.windDirectionDeg),
+        step.maxSpreadRadiusM,
+      );
+      for (const feat of arrow.features) {
+        windArrows.features.push({
+          ...feat,
+          properties: {
+            ...feat.properties,
+            selected: isSelected,
+          },
+        });
+      }
+    }
+    map.getSource<GeoJSONSource>("gw-wind")?.setData(windArrows);
+
+    if (selected && selected.status !== "EXTINGUISHED") {
+      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(firebreakLineString(selected.firebreak));
+    } else {
+      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(emptyFC());
+    }
   }, [incidents, selectedId, hourOffset, ready, styleVersion]);
 
   // Pulse ring on active incidents + blink on smoldering polygons
@@ -291,6 +335,7 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     const map = mapRef.current;
     if (!ready || !map) return;
     let raf = 0;
+    let staticOpacity = false;
     const tick = (now: number) => {
       if (map.getLayer("gw-incidents-pulse")) {
         const t = (now % PULSE_MS) / PULSE_MS;
@@ -298,21 +343,18 @@ export default function MapLibreMap(props: MapLibreMapProps) {
         map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0.5 * (1 - t));
       }
       if (map.getLayer("gw-burn-fill")) {
-        // Smoldering polygons blink (suspected/confirmed embers under the surface)
-        const selected = cb.current.incidents.find((i) => i.id === cb.current.selectedId);
-        const smoldering =
-          selected?.status === "SUSPECTED_SMOLDERING" ||
-          selected?.status === "CONFIRMED_SMOLDERING";
-        if (smoldering) {
+        // Smoldering polygons blink (suspected/confirmed embers under the surface);
+        // without any, the static opacity is written once instead of every frame.
+        const anySmolder = cb.current.incidents.some(
+          (i) => i.status === "SUSPECTED_SMOLDERING" || i.status === "CONFIRMED_SMOLDERING",
+        );
+        if (anySmolder) {
           const blink = 0.5 + 0.5 * Math.sin((now / BLINK_MS) * Math.PI * 2);
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", 0.18 + blink * 0.24);
-        } else {
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", [
-            "case",
-            ["get", "isForecast"],
-            0.22,
-            0.35,
-          ]);
+          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.18 + blink * 0.24));
+          staticOpacity = false;
+        } else if (!staticOpacity) {
+          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.3));
+          staticOpacity = true;
         }
       }
       raf = requestAnimationFrame(tick);
@@ -503,7 +545,7 @@ function installOverlays(
   // glyphs endpoint (fonts/{fontstack}/{range}.pbf) currently 404s, so a symbol
   // layer here would render nothing and log a warning per codepoint.
 
-  // Burn polygons (nowcast + forecast)
+  // Burn polygons (every live incident at the timeline hour)
   map.addSource("gw-burn", { type: "geojson", data: emptyFC() });
   map.addLayer({
     id: "gw-burn-fill",
@@ -511,7 +553,7 @@ function installOverlays(
     source: "gw-burn",
     paint: {
       "fill-color": BURN_COLOR,
-      "fill-opacity": ["case", ["get", "isForecast"], 0.22, 0.35],
+      "fill-opacity": burnOpacity(0.3),
     },
   });
   map.addLayer({
@@ -520,7 +562,7 @@ function installOverlays(
     source: "gw-burn",
     paint: {
       "line-color": BURN_COLOR,
-      "line-width": 2,
+      "line-width": ["case", ["get", "selected"], 2.5, 1.25],
       "line-dasharray": [2, 2],
     },
   });
@@ -536,6 +578,39 @@ function installOverlays(
       "line-width": 3,
       "line-dasharray": [2, 1.5],
     },
+  });
+
+  // Wind-push arrow on the selected incident; the white casing keeps it readable on every basemap
+  map.addSource("gw-wind", { type: "geojson", data: emptyFC() });
+  map.addLayer({
+    id: "gw-wind-casing",
+    type: "line",
+    source: "gw-wind",
+    filter: ["==", ["get", "part"], "shaft"],
+    layout: { "line-cap": "round" },
+    paint: {
+      "line-color": "#ffffff",
+      "line-width": ["case", ["get", "selected"], 7, 4.5],
+      "line-opacity": 0.85,
+    },
+  });
+  map.addLayer({
+    id: "gw-wind-shaft",
+    type: "line",
+    source: "gw-wind",
+    filter: ["==", ["get", "part"], "shaft"],
+    layout: { "line-cap": "round" },
+    paint: {
+      "line-color": WIND_COLOR,
+      "line-width": ["case", ["get", "selected"], 3.5, 2],
+    },
+  });
+  map.addLayer({
+    id: "gw-wind-head",
+    type: "fill",
+    source: "gw-wind",
+    filter: ["==", ["get", "part"], "head"],
+    paint: { "fill-color": WIND_COLOR, "fill-outline-color": "#ffffff" },
   });
 
   // Incident points + FRP extrusion columns
@@ -598,7 +673,7 @@ function squareAround(lng: number, lat: number, halfDeg: number): GeoJSON.Polygo
         [lng - dx, lat - halfDeg],
         [lng + dx, lat - halfDeg],
         [lng + dx, lat + halfDeg],
-        [lng - dx, lat - halfDeg],
+        [lng - dx, lat + halfDeg],
         [lng - dx, lat - halfDeg],
       ],
     ],

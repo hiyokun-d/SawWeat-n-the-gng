@@ -36,7 +36,7 @@ export async function GET(request: Request) {
         reason: "Gagal menghubungi NASA FIRMS",
       });
     }
-    const fires = dedupeFirmsFires(raw).slice(0, 8);
+    const fires = dedupeFirmsFires(raw);
     return NextResponse.json({
       configured: true,
       fires,

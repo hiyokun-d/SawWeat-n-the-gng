@@ -241,10 +241,15 @@ export const WeatherTelemetrySchema = z.object({
   updatedAt: z.string(),
 });
 
+export const WEATHER_SOURCES = ["open-meteo", "bmkg", "fallback"] as const;
+export type WeatherSource = (typeof WEATHER_SOURCES)[number];
+
 export const WeatherApiResponseSchema = z.object({
   ok: z.literal(true),
-  lokasi: BmkgLocationSchema,
+  // Only BMKG returns an administrative location block
+  lokasi: BmkgLocationSchema.nullish(),
   telemetry: WeatherTelemetrySchema,
+  source: z.enum(WEATHER_SOURCES),
 });
 
 export const MaritimeApiResponseSchema = z.object({
@@ -283,15 +288,19 @@ const COMPASS_16 = [
   "Utara",
   "Utara Timur Laut",
   "Timur Laut",
+  "Timur Timur Laut",
   "Timur",
   "Timur Tenggara",
   "Tenggara",
+  "Selatan Tenggara",
   "Selatan",
   "Selatan Barat Daya",
   "Barat Daya",
+  "Barat Barat Daya",
   "Barat",
   "Barat Barat Laut",
   "Barat Laut",
+  "Utara Barat Laut",
 ] as const;
 
 /** Indonesian maritime direction name ("Timur Laut") to degrees the wind comes FROM. */
@@ -299,13 +308,16 @@ const WIND_FROM_DEG: Record<string, number> = {
   Utara: 0,
   "Utara Timur Laut": 22.5,
   "Timur Laut": 45,
-  "Timur": 90,
+  "Timur Timur Laut": 67.5,
+  Timur: 90,
   "Timur Tenggara": 112.5,
   Tenggara: 135,
+  "Selatan Tenggara": 157.5,
   "Tenggara Selatan": 157.5,
   Selatan: 180,
   "Selatan Barat Daya": 202.5,
   "Barat Daya": 225,
+  "Barat Barat Daya": 247.5,
   Barat: 270,
   "Barat Barat Laut": 292.5,
   "Barat Laut": 315,
@@ -318,7 +330,7 @@ export function windFromNameToDeg(name: string): number {
 
 export function compassName(deg: number): string {
   const normalized = ((deg % 360) + 360) % 360;
-  return COMPASS_16[Math.round(normalized / 30) % 12];
+  return COMPASS_16[Math.round(normalized / 22.5) % 16];
 }
 
 /** Direction the wind pushes TOWARD: (from + 180) mod 360. */
