@@ -9,6 +9,7 @@ import {
   FlameIcon,
   MapPinIcon,
   NavigationIcon,
+  NewspaperIcon,
   RadioIcon,
   SatelliteIcon,
   ShieldAlertIcon,
@@ -21,6 +22,9 @@ import {
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
+import NewsPortalModal from "@/components/dashboard/NewsPortalModal";
+import { useKarhutlaNews } from "@/hooks/useKarhutlaNews";
+import type { NewsArticle } from "@/app/api/news/route";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -69,7 +73,16 @@ export default function DashboardPage() {
   const { engine, state: engineState, markReady, markFailed } = useMapEngine();
   const [mapStyle, setMapStyle] = useState<MapStyleId>("liberty");
   const [panelOpen, setPanelOpen] = useState(false);
+  const [newsOpen, setNewsOpen] = useState(false);
   const [hourOffset, setHourOffset] = useState(0);
+
+  const {
+    articles: newsArticles,
+    loading: newsLoading,
+    hasNews,
+    refresh: refreshNews,
+    updatedAt: newsUpdatedAt,
+  } = useKarhutlaNews();
 
   const selected = selectedIncident;
   const selectedStep =
@@ -117,6 +130,9 @@ export default function DashboardPage() {
       selectedIncident={selectedIncident}
       selectIncident={selectIncident}
       hourOffset={hourOffset}
+      newsArticles={newsArticles}
+      hasNews={hasNews}
+      onOpenNews={() => setNewsOpen(true)}
     />
   );
 
@@ -177,6 +193,22 @@ export default function DashboardPage() {
                 <span className="sm:hidden">Hilang</span>
               </Button>
             </>
+          )}
+          {hasNews && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setNewsOpen(true)}
+              aria-label={`Buka portal berita karhutla (${newsArticles.length} artikel)`}
+              className="h-7 gap-1.5 border-sky-500/40 bg-sky-500/10 px-2.5 text-xs text-sky-200 hover:bg-sky-500/20 hover:text-sky-100"
+            >
+              <NewspaperIcon className="size-3.5 text-sky-400" />
+              <span className="hidden sm:inline">Portal Berita BMKG</span>
+              <span className="sm:hidden">Berita</span>
+              <span className="rounded-full bg-sky-950 px-1 py-0 text-[10px] font-semibold text-sky-300 border border-sky-500/30">
+                {newsArticles.length}
+              </span>
+            </Button>
           )}
           <Button
             size="sm"
@@ -357,6 +389,15 @@ export default function DashboardPage() {
         {firmsLive ? "NASA FIRMS VIIRS near-real-time" : "simulasi (fallback)"} · Peta:
         OpenFreeMap &amp; OpenStreetMap
       </footer>
+
+      <NewsPortalModal
+        open={newsOpen}
+        onClose={() => setNewsOpen(false)}
+        articles={newsArticles}
+        loading={newsLoading}
+        onRefresh={refreshNews}
+        updatedAt={newsUpdatedAt}
+      />
     </div>
   );
 }
@@ -374,6 +415,9 @@ interface SidebarContentProps {
   selectedIncident: HotspotIncident | null;
   selectIncident: (id: string) => void;
   hourOffset: number;
+  newsArticles: NewsArticle[];
+  hasNews: boolean;
+  onOpenNews: () => void;
 }
 
 function SidebarContent({
@@ -387,6 +431,9 @@ function SidebarContent({
   selectedIncident,
   selectIncident,
   hourOffset,
+  newsArticles,
+  hasNews,
+  onOpenNews,
 }: SidebarContentProps) {
   return (
     <ScrollArea className="h-full">
@@ -527,6 +574,59 @@ function SidebarContent({
           )}
         </section>
 
+        {hasNews && newsArticles.length > 0 && (
+          <>
+            <Separator />
+            <section className="space-y-2">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+                  Warta Karhutla &amp; BMKG
+                </h2>
+                <Badge
+                  variant="outline"
+                  className="border-sky-500/30 bg-sky-500/10 px-1.5 py-0 text-[10px] text-sky-300"
+                >
+                  {newsArticles.length} Warta
+                </Badge>
+              </div>
+              <div className="flex flex-col gap-2">
+                {newsArticles.slice(0, 2).map((article) => (
+                  <div
+                    key={article.id}
+                    className="rounded-lg border border-white/10 bg-slate-950/60 p-2.5 transition-colors hover:border-slate-700"
+                  >
+                    <div className="mb-1 flex items-center justify-between gap-1">
+                      <span className="text-[10px] font-medium text-sky-400">
+                        {article.source}
+                      </span>
+                      <time dateTime={article.publishedAt} className="text-[9px] text-muted-foreground">
+                        {wibTime(article.publishedAt)}
+                      </time>
+                    </div>
+                    <a
+                      href={article.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="line-clamp-2 text-xs font-medium text-slate-200 hover:text-sky-300 hover:underline"
+                    >
+                      {article.title}
+                    </a>
+                  </div>
+                ))}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onOpenNews}
+                  className="h-8 w-full min-h-[44px] sm:min-h-[32px] text-xs border-sky-500/30 bg-sky-950/40 text-sky-200 hover:bg-sky-900/60"
+                >
+                  <NewspaperIcon className="mr-1.5 size-3.5 text-sky-400" />
+                  Buka Portal Berita ({newsArticles.length})
+                </Button>
+              </div>
+            </section>
+          </>
+        )}
+
         <Separator />
 
         {/* Field HUD sync (automatic) */}
@@ -657,6 +757,7 @@ function IncidentCard({
 
 function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hourOffset: number }) {
   const [apiBrief, setApiBrief] = useState<string | null>(null);
+  const [deadlineText, setDeadlineText] = useState<string>("-");
   const step =
     hourOffset === 0
       ? incident.nowcastPolygon
@@ -665,12 +766,16 @@ function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hour
   const village = incident.nearestVillage;
   const fb = incident.firebreak;
   const crew = Math.max(1, Math.round(fb.lengthMeters / 150));
-  const deadlineIso = new Date(Date.now() + fb.etaFireArrivalMinutes * 60_000).toISOString();
   const smoldering =
     incident.status === "SUSPECTED_SMOLDERING" || incident.status === "CONFIRMED_SMOLDERING";
 
   useEffect(() => {
-    let active = true;
+    const deadlineIso = new Date(Date.now() + fb.etaFireArrivalMinutes * 60_000).toISOString();
+    setDeadlineText(wibTime(deadlineIso));
+  }, [fb.etaFireArrivalMinutes]);
+
+  useEffect(() => {
+    const controller = new AbortController();
     const center = fb.coordinates[2] ?? fb.coordinates[0];
     const payload = {
       incidentId: incident.id,
@@ -702,17 +807,22 @@ function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hour
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     })
       .then((res) => res.json())
       .then((data: { ok?: boolean; brief?: string }) => {
-        if (active && data.ok && data.brief) {
+        if (data.ok && data.brief) {
           setApiBrief(data.brief);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          // silently keep local fallback
+        }
+      });
 
     return () => {
-      active = false;
+      controller.abort();
     };
   }, [incident, hourOffset, fb, village, step.burnedAreaHa]);
 
@@ -756,7 +866,7 @@ function BriefingBox({ incident, hourOffset }: { incident: HotspotIncident; hour
             <p>
               <span className="font-semibold">Instruksi:</span> kerahkan {crew} regu MPA untuk memotong
               jalur sekat bakar sepanjang {Math.round(fb.lengthMeters)} m di garis kuning peta,
-              tuntas sebelum pukul {wibTime(deadlineIso)}.
+              tuntas sebelum pukul {deadlineText}.
             </p>
             <p>
               <span className="font-semibold">Luas terancam:</span> {step.burnedAreaHa.toFixed(1)} ha
