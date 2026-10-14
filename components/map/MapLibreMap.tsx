@@ -102,9 +102,9 @@ const HOME_CAMERA = {
   bearing: -12,
 };
 
-const PULSE_MS = 1600;
+const PULSE_MS = 2800;
 const GROW_MS = 1400;
-const BLINK_MS = 1100;
+const BLINK_MS = 2800;
 
 export default function MapLibreMap(props: MapLibreMapProps) {
   const { incidents, selectedId, hourOffset, mapStyle } = props;
@@ -330,31 +330,52 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     }
   }, [incidents, selectedId, hourOffset, ready, styleVersion]);
 
-  // Pulse ring on active incidents + blink on smoldering polygons
+  // Pulse ring on active incidents + blink on smoldering polygons (throttled for GPU efficiency)
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map) return;
+
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (reducedMotion) {
+      if (map.getLayer("gw-burn-fill")) {
+        map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.28));
+      }
+      if (map.getLayer("gw-incidents-pulse")) {
+        map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0);
+      }
+      return;
+    }
+
     let raf = 0;
+    let lastTick = 0;
     let staticOpacity = false;
     const tick = (now: number) => {
-      if (map.getLayer("gw-incidents-pulse")) {
-        const t = (now % PULSE_MS) / PULSE_MS;
-        map.setPaintProperty("gw-incidents-pulse", "circle-radius", ["+", BASE_RADIUS, t * 18]);
-        map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0.5 * (1 - t));
+      if (typeof document !== "undefined" && document.hidden) {
+        raf = requestAnimationFrame(tick);
+        return;
       }
-      if (map.getLayer("gw-burn-fill")) {
-        // Smoldering polygons blink (suspected/confirmed embers under the surface);
-        // without any, the static opacity is written once instead of every frame.
-        const anySmolder = cb.current.incidents.some(
-          (i) => i.status === "SUSPECTED_SMOLDERING" || i.status === "CONFIRMED_SMOLDERING",
-        );
-        if (anySmolder) {
-          const blink = 0.5 + 0.5 * Math.sin((now / BLINK_MS) * Math.PI * 2);
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.18 + blink * 0.24));
-          staticOpacity = false;
-        } else if (!staticOpacity) {
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.3));
-          staticOpacity = true;
+      if (now - lastTick >= 33) {
+        lastTick = now;
+        if (map.getLayer("gw-incidents-pulse")) {
+          const t = (now % PULSE_MS) / PULSE_MS;
+          map.setPaintProperty("gw-incidents-pulse", "circle-radius", ["+", BASE_RADIUS, t * 12]);
+          map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0.35 * (1 - t));
+        }
+        if (map.getLayer("gw-burn-fill")) {
+          const anySmolder = cb.current.incidents.some(
+            (i) => i.status === "SUSPECTED_SMOLDERING" || i.status === "CONFIRMED_SMOLDERING",
+          );
+          if (anySmolder) {
+            const blink = 0.5 + 0.5 * Math.sin((now / BLINK_MS) * Math.PI * 2);
+            map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.22 + blink * 0.16));
+            staticOpacity = false;
+          } else if (!staticOpacity) {
+            map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.3));
+            staticOpacity = true;
+          }
         }
       }
       raf = requestAnimationFrame(tick);
