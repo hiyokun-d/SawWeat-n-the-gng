@@ -24,14 +24,14 @@ joints/
 │   └── hud/
 │       ├── VectorCompass.tsx    # Kompas SVG arah angin & kepala api
 │       └── GroundTruthButtons.tsx # 3 tombol verifikasi 1-klik MPA
-├── hooks/useIncidents.ts        # State bersama: seed, cuaca BMKG, engine, sync
+├── hooks/useIncidents.ts        # State bersama: titik api FIRMS, cuaca BMKG, engine, sync
 ├── lib/
 │   ├── gambut.ts                # Kontrak data (prd.md) + skema BMKG
 │   ├── simulationEngine.ts      # Rumus Cellular Automata, nowcast, forecast, firebreak
 │   └── syncChannel.ts           # BroadcastChannel + localStorage Desktop <-> Mobile
 └── data/
     ├── khgKalbar.geojson.ts     # Poligon KHG Sungai Kapuas - Sungai Ambawang
-    └── seedIncidents.ts         # 4 insiden seed Kubu Raya (fallback demo)
+    └── hotspotSource.ts         # Konversi titik panas VIIRS jadi sumber insiden
 ```
 
 ## Rumus Algoritma (lib/simulationEngine.ts)
@@ -73,13 +73,12 @@ putus-putus #FACC15.
 2. Copy `.env.example` menjadi `.env.local` dan isi `MAP_KEY=...`
 3. Restart dev server
 
-Tanpa `MAP_KEY`, aplikasi tetap berjalan dengan skenario simulasi 4 hotspot
-(penanda "SIMULASI" di HUD, banner peringatan di dasbor). Dengan key, titik api
-asli VIIRS near-real-time menggantikan skenario simulasi, tombol demo
-"Simulasi: Hotspot" disembunyikan, dan badge HUD berubah "FIRMS LIVE".
-Deteksi confidence tinggi dianggap api permukaan aktif; nominal/low menunggu
-verifikasi lapangan. Atribusi NASA FIRMS wajib ditampilkan dan sudah ada di
-dasbor, HUD, dan peta.
+Tanpa `MAP_KEY`, tidak ada titik api satelit yang ditampilkan: dasbor dan HUD
+menampilkan empty state beserta penjelasannya (banner notice di dasbor). Dengan
+key, titik api asli VIIRS near-real-time langsung diproses mesin simulasi, dan
+badge HUD berubah "FIRMS LIVE". Deteksi confidence tinggi dianggap api
+permukaan aktif; nominal/low menunggu verifikasi lapangan. Atribusi NASA FIRMS
+wajib ditampilkan dan sudah ada di dasbor, HUD, dan peta.
 
 Peta dua mesin (tanpa API key): MapLibre GL sebagai mesin utama (proyeksi globe,
 terrain Mapterhorn, bangunan 3D, kolom FRP, animasi intro) dengan tiga gaya
@@ -99,15 +98,9 @@ HUD, peta, dan footer. Kuota akses 60 permintaan/menit per IP.
    Perubahan status dari HUD langsung tersinkronisasi ke dasbor (BroadcastChannel).
 2. **Timeline slider**: geser t+0 s.d t+12 jam atau tekan Play untuk animasi
    perambatan; metrik laju R dan luas terancam (ha) update dinamis.
-3. **Skenario 1 - Hotspot baru di luar poligon**: tombol "Simulasi: Hotspot Baru"
-   menambah titik api di luar prediksi, menggabungkan poligon (turf.union), dan
-   menggeser garis firebreak ke depan.
-4. **Skenario 2 - Smoldering blindness**: tombol "Simulasi: Hotspot Hilang"
-   mengubah status hotspot yang hilang dari satelit menjadi SUSPECTED_SMOLDERING
-   (poligon oranye berkedip) dan mengirim permintaan verifikasi ke HUD MPA.
-5. **Verifikasi lapangan 1-klik**: tiga tombol di HUD (api aktif / bara bawah
+3. **Verifikasi lapangan 1-klik**: tiga tombol di HUD (api aktif / bara bawah
    tanah / padam total) mengubah status insiden di dasbor.
-6. **Mode offline**: toggle ONLINE/OFFLINE (CACHED) di HUD; status terakhir
+4. **Mode offline**: toggle ONLINE/OFFLINE (CACHED) di HUD; status terakhir
    insiden dipulihkan dari localStorage saat tab dimuat ulang.
 
 ## Menjalankan

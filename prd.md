@@ -127,6 +127,7 @@ Logika Asimilasi Data Satelit & Smoldering Blindness
 Sediakan 3 tombol simulasi pembaruan satelit di pojok atas dasbor untuk didemokan kepada juri:
 Skenario 1: "Simulasi Update Satelit: Hotspot Baru di Luar Poligon": Sistem menambahkan titik api baru di luar batas prediksi, melakukan re-anchoring (menggabungkan dua poligon dengan turf.union), dan menggeser garis firebreak lebih jauh ke depan disertai peringatan suara/visual ke MPA.
 Skenario 2: "Simulasi Update Satelit: Hotspot Hilang (Smoldering Blindness)": Titik panas dari satelit menghilang karena tertutup tanah/asap. Sistem menolak mengubah status menjadi padam, melainkan mengubah status menjadi SUSPECTED_SMOLDERING (poligon berubah warna menjadi Oranye Berkedip) dan mengirim permintaan verifikasi lapangan ke tampilan HP MPA.
+CATATAN (Oktober 2026): tombol simulasi pembaruan satelit (Skenario 1 dan 2) sudah dihapus atas keputusan tim; seluruh hotspot hanya bersumber dari data NASA FIRMS.
 
 Integrasi API Publik & Strategi Fallback Data
 Cuaca Mikro Lokal (Open-Meteo API — Tanpa API Key / Gratis):
@@ -136,6 +137,7 @@ Endpoint:
 Titik Panas Satelit (NASA FIRMS API + Fallback Seed):
 Endpoint Live VIIRS 375m: [https://firms.modaps.eosdis.nasa.gov/api/country/csv/](https://firms.modaps.eosdis.nasa.gov/api/country/csv/){MAP_KEY}/VIIRS_SNPP_NRT/IDN/1
 ATURAN WAJIB HACKATHON (Fallback Seed Data): Buat berkas data/mockIncidentsKalbar.json berisi 4 titik insiden realistis di Kabupaten Kubu Raya, Kalimantan Barat (wilayah kebakaran gambut tertinggi nasional 2026: 38.310 ha), lengkap dengan poligon GeoJSON Kesatuan Hidrologis Gambut (KHG) Sungai Kapuas. Jika saat penilaian juri sedang turun hujan di Kalimantan sehingga API NASA FIRMS kosong, aplikasi tetap memuat skenario krisis dari data seed yang dikombinasikan dengan cuaca live Open-Meteo
+CATATAN (Oktober 2026): fallback seed tidak lagi diterapkan atas keputusan tim; hotspot hanya bersumber dari NASA FIRMS, dan kondisi kosong ditangani dengan empty state yang menjelaskan status sumber data.
 Spesifikasi Fitur & Antarmuka Pengguna (Dual-View)
 Layar 1: Dasbor Strategis Pusdalops BPBD (Route: /dashboard — Desktop 16:9)
 Top Bar:
@@ -194,4 +196,4 @@ gambutwatch/
 │ │ └── syncChannel.ts # BroadcastChannel + LocalStorage sync antara Desktop & Mobile
 │ └── data/
 │ ├── khgKalbar.geojson.ts # Poligon Kesatuan Hidrologis Gambut Kubu Raya
-│ └── seedIncidents.ts # Data titik panas VIIRS nyata/simulasi untuk demo stabil
+│ └── hotspotSource.ts # Konversi titik panas VIIRS jadi sumber insiden mesin simulasi

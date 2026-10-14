@@ -1,10 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { destination, point } from "@turf/turf";
 import {
   DEFAULT_ADM4,
-  FIRMS_ATTRIBUTION,
   FirmsApiResponseSchema,
   MaritimeApiResponseSchema,
   toFireStatus,
@@ -15,18 +13,10 @@ import {
   type WeatherSource,
   type WeatherTelemetry,
 } from "@/lib/gambut";
-import {
-  FIRST_SEED_ID,
-  createSeedIncidents,
-  fallbackWeather,
-  firePointToSeed,
-  type SeedIncident,
-} from "@/data/seedIncidents";
+import { fallbackWeather, firePointToSource, type HotspotSource } from "@/data/hotspotSource";
 import {
   computeFirebreak,
   computeNearestVillage,
-  mergeBurnPolygons,
-  polygonAreaHa,
   simulateSpread,
 } from "@/lib/simulationEngine";
 import {
@@ -55,72 +45,60 @@ type IncidentGeometry = Pick<
   "nowcastPolygon" | "forecastPolygons" | "firebreak" | "nearestVillage"
 >;
 
-// Polygons only depend on the seed and the weather, not on the verification
-// status, so a status change (HUD button, demo scenario) reuses them.
+// Polygons only depend on the source hotspot and the weather, not on the
+// verification status, so a status change (HUD button) reuses them.
 const geometryCache = new WeakMap<
-  SeedIncident,
+  HotspotSource,
   { weather: WeatherTelemetry; geometry: IncidentGeometry }
 >();
 
-function incidentGeometry(seed: SeedIncident, weather: WeatherTelemetry): IncidentGeometry {
-  const cached = geometryCache.get(seed);
+function incidentGeometry(source: HotspotSource, weather: WeatherTelemetry): IncidentGeometry {
+  const cached = geometryCache.get(source);
   if (cached && cached.weather === weather) return cached.geometry;
 
   const now = new Date();
   const simInput = {
-    originLat: seed.originLat,
-    originLng: seed.originLng,
-    satelliteAcquisitionTime: seed.satelliteAcquisitionTime,
+    originLat: source.originLat,
+    originLng: source.originLng,
+    satelliteAcquisitionTime: source.satelliteAcquisitionTime,
     weather,
-    peatlandInfo: seed.peatlandInfo,
+    peatlandInfo: source.peatlandInfo,
   };
   const sim = simulateSpread(simInput, now);
-
-  // Re-anchored polygon from a satellite-update demo (scenario 1)
-  const nowcastPolygon = seed.mergedNowcast
-    ? {
-        ...sim.nowcastPolygon,
-        geojsonPolygon: seed.mergedNowcast,
-        burnedAreaHa: polygonAreaHa(seed.mergedNowcast),
-      }
-    : sim.nowcastPolygon;
-
-  // Widened buffer pushes the firebreak farther ahead after re-anchoring
-  const firebreak = computeFirebreak(simInput, now, seed.mergedNowcast ? { bufferM: 300 } : undefined);
-
+  const firebreak = computeFirebreak(simInput, now);
   const nearestVillage = computeNearestVillage(
-    seed.originLat,
-    seed.originLng,
+    source.originLat,
+    source.originLng,
     weather.windDirectionDeg,
     now,
-    seed.satelliteAcquisitionTime,
-    seed.peatlandInfo,
+    source.satelliteAcquisitionTime,
+    source.peatlandInfo,
     weather,
     sim.headRate,
   );
 
   const geometry: IncidentGeometry = {
-    nowcastPolygon,
+    nowcastPolygon: sim.nowcastPolygon,
     forecastPolygons: sim.forecastPolygons,
     firebreak,
     nearestVillage,
   };
-  geometryCache.set(seed, { weather, geometry });
+  geometryCache.set(source, { weather, geometry });
   return geometry;
 }
 
 function buildIncident(
-  seed: SeedIncident,
+  source: HotspotSource,
   weather: WeatherTelemetry,
   status: FireStatus,
   verifiedBy?: string,
   verifiedAt?: string,
 ): HotspotIncident {
   return {
-    ...seed,
+    ...source,
     status,
     weather,
-    ...incidentGeometry(seed, weather),
+    ...incidentGeometry(source, weather),
     lastVerifiedBy: verifiedBy,
     lastVerifiedAt: verifiedAt,
   };
@@ -138,41 +116,32 @@ export interface UseIncidentsResult {
   selectIncident: (id: string) => void;
   selectedIncident: HotspotIncident | null;
   refreshWeather: () => void;
-  simulateNewHotspot: () => void;
-  simulateHotspotLost: () => void;
   satelliteNotice: string | null;
   /** NASA FIRMS live fire detections (empty when key missing or no fires). */
   firePoints: FirePoint[];
-  /** True when MAP_KEY is set and FIRMS replied. */
+  /** True when MAP_KEY is set and FIRMS replied with detections. */
   firmsLive: boolean;
+  /** True until the first FIRMS response lands (distinguishes loading from empty). */
+  firmsLoading: boolean;
 }
 
 export function useIncidents(): UseIncidentsResult {
-  // Seeds load in a mount effect: timestamps must not run during prerender
-  const [seeds, setSeeds] = useState<SeedIncident[]>([]);
   const [statuses, setStatuses] = useState<StatusMap>({});
   const [weather, setWeather] = useState<WeatherTelemetry | null>(null);
   const [weatherSource, setWeatherSource] = useState<WeatherSource | null>(null);
   const [maritime, setMaritime] = useState<MaritimeConditions | null>(null);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
-  const [selectedId, setSelectedId] = useState<string>(FIRST_SEED_ID);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [satelliteNotice, setSatelliteNotice] = useState<string | null>(null);
   const [firePoints, setFirePoints] = useState<FirePoint[]>([]);
   const [firmsConfigured, setFirmsConfigured] = useState(false);
+  const [firmsLoading, setFirmsLoading] = useState(true);
   const hydrated = useRef(false);
 
-  // Mirror state in refs so demo handlers always see fresh values
-  const seedsRef = useRef(seeds);
-  seedsRef.current = seeds;
-  const weatherRef = useRef(weather);
-  weatherRef.current = weather;
+  // Mirror state in refs so the FIRMS loader always sees fresh values
   const firePointsRef = useRef(firePoints);
   firePointsRef.current = firePoints;
-
-  useEffect(() => {
-    setSeeds(createSeedIncidents());
-  }, []);
 
   /* ---------------- weather (Open-Meteo, BMKG fallback) ---------------- */
 
@@ -241,23 +210,25 @@ export function useIncidents(): UseIncidentsResult {
       setFirePoints(parsed.data.fires);
       if (parsed.data.configured && parsed.data.fires.length > 0) {
         setSatelliteNotice(
-          `${parsed.data.fires.length} titik api terdeteksi NASA FIRMS (VIIRS near-real-time) di area KHG. Skenario simulasi dimatikan.`,
+          `${parsed.data.fires.length} titik api terdeteksi NASA FIRMS (VIIRS near-real-time) di area KHG.`,
         );
       } else if (parsed.data.configured && parsed.data.reason) {
         setSatelliteNotice(
-          `${parsed.data.reason}. Menampilkan skenario simulasi sampai data satelit bisa dimuat ulang.`,
+          `${parsed.data.reason} Titik api tidak bisa ditampilkan sampai koneksi satelit normal kembali.`,
         );
       } else if (parsed.data.configured) {
         setSatelliteNotice(
-          `NASA FIRMS tidak mendeteksi hotspot di area KHG dalam 3 hari terakhir. Menampilkan skenario simulasi (${FIRMS_ATTRIBUTION}).`,
+          `NASA FIRMS tidak mendeteksi hotspot di area KHG dalam 3 hari terakhir.`,
         );
       } else {
         setSatelliteNotice(
-          `MAP_KEY NASA FIRMS belum diset; menampilkan skenario simulasi. Daftar gratis di https://firms.modaps.eosdis.nasa.gov/api/`,
+          `MAP_KEY NASA FIRMS belum diset, data titik api satelit tidak tersedia. Daftar gratis di https://firms.modaps.eosdis.nasa.gov/api/`,
         );
       }
     } catch {
-      // FIRMS is supplementary; keep the seed scenario on failure
+      // FIRMS is supplementary; keep the detections already on screen
+    } finally {
+      setFirmsLoading(false);
     }
   }, []);
 
@@ -316,31 +287,24 @@ export function useIncidents(): UseIncidentsResult {
 
   /* ---------------- incidents (engine) ---------------- */
 
-  const realSeeds = useMemo(
-    () => firePoints.map(firePointToSeed),
+  const sources = useMemo(
+    () => firePoints.map(firePointToSource),
     [firePoints],
   );
-  const usingFirms = firmsConfigured && realSeeds.length > 0;
-  const effectiveSeeds = useMemo(() => {
-    if (!usingFirms) return seeds;
-    const seedIds = new Set(seeds.map((s) => s.id));
-    const nonCollidingReal = realSeeds.filter((r) => !seedIds.has(r.id));
-    return [...seeds, ...nonCollidingReal];
-  }, [usingFirms, seeds, realSeeds]);
 
   const incidents = useMemo(() => {
-    return effectiveSeeds.map((seed) => {
-      const entry = statuses[seed.id];
-      const effectiveWeather = weather ?? seed.fallbackWeather;
+    return sources.map((source) => {
+      const entry = statuses[source.id];
+      const effectiveWeather = weather ?? fallbackWeather();
       return buildIncident(
-        seed,
+        source,
         effectiveWeather,
-        entry?.status ?? seed.status,
+        entry?.status ?? source.status,
         entry?.verifiedBy,
         entry?.verifiedAt,
       );
     });
-  }, [effectiveSeeds, statuses, weather]);
+  }, [sources, statuses, weather]);
 
   const selectedIncident = useMemo(
     () => incidents.find((i) => i.id === selectedId) ?? incidents[0] ?? null,
@@ -351,92 +315,6 @@ export function useIncidents(): UseIncidentsResult {
     setSelectedId(id);
     publishSync({ type: "incident:select", id });
   }, []);
-
-  /* ---------------- satellite update simulations ---------------- */
-
-  const simulateNewHotspot = useCallback(() => {
-    const prev = seedsRef.current;
-    const anchor = prev.find((s) => s.id === selectedId) ?? prev[0];
-    const anchorWeather = weatherRef.current ?? anchor.fallbackWeather;
-
-    const anchorSim = simulateSpread({
-      originLat: anchor.originLat,
-      originLng: anchor.originLng,
-      satelliteAcquisitionTime: anchor.satelliteAcquisitionTime,
-      weather: anchorWeather,
-      peatlandInfo: anchor.peatlandInfo,
-    });
-
-    // New hotspot outside the current prediction polygon: 500 m beyond the
-    // max spread radius, 120 degrees off the wind push axis.
-    const bearing = (anchorWeather.windVectorDeg + 120) % 360;
-    const km = (anchorSim.nowcastPolygon.maxSpreadRadiusM + 500) / 1000;
-    const pt = destination(point([anchor.originLng, anchor.originLat]), km, bearing, {
-      units: "kilometers",
-    });
-    const [lng, lat] = pt.geometry.coordinates;
-
-    const newSeed: SeedIncident = {
-      id: `GW-KHR-${String(prev.length + 1).padStart(3, "0")}`,
-      originLat: lat,
-      originLng: lng,
-      satelliteAcquisitionTime: new Date().toISOString(),
-      systemReceivedTime: new Date().toISOString(),
-      frpMegawatt: 55.4,
-      confidence: "high",
-      status: "UNVERIFIED_HOTSPOT",
-      peatlandInfo: anchor.peatlandInfo,
-      fallbackWeather: anchorWeather,
-    };
-
-    const newSim = simulateSpread({
-      originLat: newSeed.originLat,
-      originLng: newSeed.originLng,
-      satelliteAcquisitionTime: newSeed.satelliteAcquisitionTime,
-      weather: anchorWeather,
-      peatlandInfo: newSeed.peatlandInfo,
-    });
-
-    // Re-anchor: union the fresh burn polygon into the selected incident
-    const merged = mergeBurnPolygons(
-      anchorSim.nowcastPolygon.geojsonPolygon,
-      newSim.nowcastPolygon.geojsonPolygon,
-    );
-
-    setSeeds([
-      ...prev.map((s) => (s.id === anchor.id ? { ...s, mergedNowcast: merged } : s)),
-      newSeed,
-    ]);
-    publishSync({ type: "incident:satellite-update", kind: "new-hotspot" });
-    setSatelliteNotice(
-      `UPDATE SATELIT: hotspot baru ${newSeed.id} di luar poligon prediksi. Poligon digabung, garis sekat bakar digeser ke depan.`,
-    );
-  }, [selectedId]);
-
-  const simulateHotspotLost = useCallback(() => {
-    const target = incidents.find(
-      (i) => i.status === "CONFIRMED_FLAMING" || i.status === "UNVERIFIED_HOTSPOT",
-    );
-    if (!target) {
-      setSatelliteNotice("Tidak ada hotspot aktif yang bisa hilang dari satelit.");
-      return;
-    }
-    setStatuses((prev) => ({
-      ...prev,
-      [target.id]: { status: "SUSPECTED_SMOLDERING" },
-    }));
-    publishSync({
-      type: "incident:status",
-      id: target.id,
-      status: "SUSPECTED_SMOLDERING",
-      verifiedBy: "Sistem (smoldering blindness)",
-      verifiedAt: new Date().toISOString(),
-    });
-    setSelectedId(target.id);
-    setSatelliteNotice(
-      `UPDATE SATELIT: hotspot ${target.id} hilang dari jangkauan sensor (tertutup tanah/asap). Status diubah menjadi SUSPECTED_SMOLDERING, permintaan verifikasi dikirim ke HUD MPA.`,
-    );
-  }, [incidents]);
 
   return {
     incidents,
@@ -449,10 +327,9 @@ export function useIncidents(): UseIncidentsResult {
     selectIncident,
     selectedIncident,
     refreshWeather: loadWeather,
-    simulateNewHotspot,
-    simulateHotspotLost,
     satelliteNotice,
     firePoints,
-    firmsLive: usingFirms,
+    firmsLive: firmsConfigured && sources.length > 0,
+    firmsLoading,
   };
 }

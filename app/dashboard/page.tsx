@@ -2,22 +2,19 @@
 
 import { AnimatePresence, motion } from "motion/react";
 import {
-  ActivityIcon,
-  AlertTriangleIcon,
-  ClockIcon,
+  DropletsIcon,
   ExternalLinkIcon,
   FlameIcon,
-  MapPinIcon,
   NavigationIcon,
   NewspaperIcon,
   RadioIcon,
-  SatelliteIcon,
   ShieldAlertIcon,
   SmartphoneIcon,
   ThermometerIcon,
   TimerIcon,
   TriangleAlertIcon,
   WavesIcon,
+  WindIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
@@ -65,8 +62,6 @@ export default function DashboardPage() {
     maritime,
     satelliteNotice,
     selectIncident,
-    simulateNewHotspot,
-    simulateHotspotLost,
     firmsLive,
   } = useIncidents();
 
@@ -170,30 +165,6 @@ export default function DashboardPage() {
           <Badge variant="outline" className="border-amber-500/40 text-amber-300">
             {smolderingCount} Suspected Smoldering
           </Badge>
-          {!firmsLive && (
-            <>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => simulateNewHotspot()}
-                className="h-7 gap-1.5 px-2 text-xs"
-              >
-                <SatelliteIcon className="size-3.5" />
-                <span className="hidden sm:inline">Simulasi: Hotspot Baru</span>
-                <span className="sm:hidden">Baru</span>
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => simulateHotspotLost()}
-                className="h-7 gap-1.5 px-2 text-xs"
-              >
-                <AlertTriangleIcon className="size-3.5" />
-                <span className="hidden sm:inline">Simulasi: Hotspot Hilang</span>
-                <span className="sm:hidden">Hilang</span>
-              </Button>
-            </>
-          )}
           {hasNews && (
             <Button
               size="sm"
@@ -386,7 +357,7 @@ export default function DashboardPage() {
       {/* Footer */}
       <footer className="shrink-0 border-t bg-card/60 px-3 py-1.5 text-center text-[10px] text-muted-foreground md:px-4">
         Sumber data: BMKG (prakiraan cuaca &amp; maritim) · Data hotspot:{" "}
-        {firmsLive ? "NASA FIRMS VIIRS near-real-time" : "simulasi (fallback)"} · Peta:
+        {firmsLive ? "NASA FIRMS VIIRS near-real-time" : "NASA FIRMS belum aktif"} · Peta:
         OpenFreeMap &amp; OpenStreetMap
       </footer>
 
@@ -471,41 +442,51 @@ function SidebarContent({
           {weather && (
             <Card className="border-white/10 bg-slate-950/60">
               <CardContent className="space-y-2.5 p-3">
-                <div className="flex items-baseline justify-between">
-                  <span className="text-xs text-muted-foreground">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="min-w-0 truncate text-xs text-muted-foreground">
                     {BmkgVillages[0].name} ({DEFAULT_ADM4})
                   </span>
-                  <span className="text-xs text-muted-foreground">{wibTime(weather.updatedAt)}</span>
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  <Metric
-                    icon={<ActivityIcon className="size-3.5" />}
-                    label="Angin"
-                    value={`${Math.round(weather.windSpeedKmh)}`}
-                    unit="km/jam"
-                  />
-                  <Metric
-                    icon={
-                      <NavigationIcon
-                        className="size-3.5 text-sky-400 transition-transform duration-300"
-                        style={{ transform: `rotate(${weather.windVectorDeg}deg)` }}
-                      />
-                    }
-                    label="Dorongan"
-                    value={`${compassName(weather.windVectorDeg)}`}
-                    unit={`${Math.round(weather.windVectorDeg)}°`}
-                  />
-                  <Metric
-                    icon={<ThermometerIcon className="size-3.5" />}
-                    label="Kelembapan"
-                    value={`${Math.round(weather.relativeHumidity)}`}
-                    unit="% RH"
-                  />
-                </div>
-                <div className="flex items-baseline justify-between">
-                  <span className="text-xs text-muted-foreground">
-                    Suhu udara {Math.round(weather.temperatureC)}°C
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {wibTime(weather.updatedAt)}
                   </span>
+                </div>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-xs">
+                  <dt className="flex items-center gap-1.5 text-muted-foreground">
+                    <WindIcon className="size-3.5" />
+                    Angin
+                  </dt>
+                  <dd className="text-right font-semibold tabular-nums">
+                    {Math.round(weather.windSpeedKmh)} km/jam
+                  </dd>
+                  <dt className="flex items-center gap-1.5 text-muted-foreground">
+                    <NavigationIcon
+                      className="size-3.5 text-sky-400 transition-transform duration-300"
+                      style={{ transform: `rotate(${weather.windVectorDeg}deg)` }}
+                    />
+                    Dorongan
+                  </dt>
+                  <dd className="text-right font-semibold tabular-nums">
+                    {compassName(weather.windVectorDeg)}{" "}
+                    <span className="text-muted-foreground">
+                      {Math.round(weather.windVectorDeg)}°
+                    </span>
+                  </dd>
+                  <dt className="flex items-center gap-1.5 text-muted-foreground">
+                    <DropletsIcon className="size-3.5" />
+                    Kelembapan
+                  </dt>
+                  <dd className="text-right font-semibold tabular-nums">
+                    {Math.round(weather.relativeHumidity)} % RH
+                  </dd>
+                  <dt className="flex items-center gap-1.5 text-muted-foreground">
+                    <ThermometerIcon className="size-3.5" />
+                    Suhu udara
+                  </dt>
+                  <dd className="text-right font-semibold tabular-nums">
+                    {Math.round(weather.temperatureC)}°C
+                  </dd>
+                </dl>
+                <div className="flex justify-end">
                   <Badge
                     variant="outline"
                     className={
@@ -546,18 +527,24 @@ function SidebarContent({
           <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
             Insiden Aktif ({incidents.length})
           </h2>
-          <div className="flex flex-col gap-2">
-            <AnimatePresence mode="popLayout">
-              {incidents.map((incident) => (
-                <IncidentCard
-                  key={incident.id}
-                  incident={incident}
-                  selected={incident.id === selectedId}
-                  onSelect={() => selectIncident(incident.id)}
-                />
-              ))}
-            </AnimatePresence>
-          </div>
+          {incidents.length === 0 ? (
+            <p className="rounded-md border border-white/10 bg-slate-950/60 px-3 py-4 text-center text-xs text-muted-foreground">
+              Belum ada titik api NASA FIRMS terdeteksi di area KHG.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <AnimatePresence mode="popLayout">
+                {incidents.map((incident) => (
+                  <IncidentCard
+                    key={incident.id}
+                    incident={incident}
+                    selected={incident.id === selectedId}
+                    onSelect={() => selectIncident(incident.id)}
+                  />
+                ))}
+              </AnimatePresence>
+            </div>
+          )}
         </section>
 
         <Separator />
@@ -664,29 +651,6 @@ function EngineStatus({ state }: { state: MapEngineState }) {
     <div className="flex items-center gap-2 rounded-md border border-white/10 bg-slate-950/60 px-2.5 py-1.5">
       <span className={`size-2 shrink-0 rounded-full bg-current ${color}`} />
       <span className="text-[11px] text-muted-foreground">{label}</span>
-    </div>
-  );
-}
-
-function Metric({
-  icon,
-  label,
-  value,
-  unit,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  unit: string;
-}) {
-  return (
-    <div className="rounded-md bg-white/5 p-2 text-center">
-      <div className="mb-0.5 flex items-center justify-center gap-1 text-muted-foreground">
-        {icon}
-        <span className="text-[10px]">{label}</span>
-      </div>
-      <p className="text-lg leading-none font-bold tabular-nums">{value}</p>
-      <p className="text-[9px] text-muted-foreground">{unit}</p>
     </div>
   );
 }
