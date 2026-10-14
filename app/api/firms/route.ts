@@ -15,7 +15,7 @@ export async function GET(request: Request) {
   // FIRMS fetch and MAP_KEY lookup are never frozen into the build output.
   new URL(request.url).searchParams.get("refresh");
 
-  const key = process.env.MAP_KEY;
+  const key = process.env.MAP_KEY?.trim();
 
   if (!key) {
     return NextResponse.json({
