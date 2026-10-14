@@ -124,20 +124,23 @@ export default function HudMap({ incidents, selectedId, position, onSelectIncide
         .addTo(layer);
     }
 
-    if (!selected) return;
+    const live = list.filter((i) => i.status !== "EXTINGUISHED");
+    for (const incident of live) {
+      const isSelected = incident.id === selected?.id;
+      L.geoJSON(incident.nowcastPolygon.geojsonPolygon as GeoJSON.GeoJsonObject, {
+        interactive: false,
+        style: {
+          color: smolderingColor(incident.status),
+          weight: isSelected ? 2.5 : 1.25,
+          dashArray: "3 3",
+          fillColor: smolderingColor(incident.status),
+          fillOpacity: isSelected ? 0.35 : 0.18,
+          className: smolderingClass(incident.status),
+        },
+      }).addTo(layer);
+    }
 
-    // Nowcast polygon (current predicted burn area)
-    L.geoJSON(selected.nowcastPolygon.geojsonPolygon as GeoJSON.GeoJsonObject, {
-      interactive: false,
-      style: {
-        color: smolderingColor(selected.status),
-        weight: 2,
-        dashArray: "3 3",
-        fillColor: smolderingColor(selected.status),
-        fillOpacity: 0.35,
-        className: smolderingClass(selected.status),
-      },
-    }).addTo(layer);
+    if (!selected || selected.status === "EXTINGUISHED") return;
 
     // Firebreak line + cut point
     const fb = selected.firebreak;

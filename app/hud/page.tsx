@@ -29,6 +29,7 @@ import {
 import { subscribeSync } from "@/lib/syncChannel";
 import { useIncidents } from "@/hooks/useIncidents";
 import GroundTruthButtons from "@/components/hud/GroundTruthButtons";
+import VectorCompass from "@/components/hud/VectorCompass";
 
 // Leaflet touches `window` on import, so the map loads client-only.
 const HudMap = dynamic(() => import("@/components/hud/HudMap"), { ssr: false });
@@ -239,6 +240,30 @@ export default function HudPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Vector Compass */}
+      {weather && (
+        <motion.section
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, ease: "easeOut", delay: 0.08 }}
+          className="flex flex-col items-center rounded-2xl border border-slate-800 bg-slate-900/80 p-3.5 shadow-lg backdrop-blur"
+        >
+          <div className="mb-2 flex w-full items-center justify-between text-xs">
+            <span className="font-semibold text-slate-300">Kompas Vektor Lapangan</span>
+            <span className="font-medium text-sky-400">
+              Angin {Math.round(weather.windSpeedKmh)} km/jam → {compassName(weather.windVectorDeg)}
+            </span>
+          </div>
+          <VectorCompass
+            windVectorDeg={weather.windVectorDeg}
+            windSpeedKmh={weather.windSpeedKmh}
+            fireBearingDeg={incident ? fireBearing : undefined}
+            fireDistanceM={incident ? fireDistance : undefined}
+            sensor={true}
+          />
+        </motion.section>
+      )}
 
       {/* Firebreak card */}
       {incident && (
