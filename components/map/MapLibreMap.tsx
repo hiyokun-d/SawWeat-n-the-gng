@@ -3,7 +3,7 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 import * as maplibregl from "maplibre-gl";
 import type { GeoJSONSource } from "maplibre-gl";
-import type { FeatureCollection, Point, Polygon } from "geojson";
+import type { FeatureCollection } from "geojson";
 import {
   BoxIcon,
   Building2Icon,
@@ -14,14 +14,14 @@ import {
 } from "lucide-react";
 import { motion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
-import type { TerraDraw } from "terra-draw";
-import { TerraDrawMapLibreGLAdapter } from "terra-draw-maplibre-gl-adapter";
 import { Button } from "@/components/ui/button";
-import { FIRMS_ATTRIBUTION, getMapStyle } from "@/lib/basemaps";
-import type { Fire } from "@/lib/fire-types";
+import { BMKG_ATTRIBUTION, getMapStyle } from "@/lib/basemaps";
+import { FIRE_STATUS_COLOR, type HotspotIncident } from "@/lib/gambut";
 import { addTerrainLayers, setTerrainEnabled } from "@/lib/terrain";
-import { createTerraDraw } from "./terra";
-import { INITIAL_CENTER, INITIAL_ZOOM, type FireMapProps } from "./types";
+import { firebreakLineString } from "@/lib/simulationEngine";
+import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
+import { BmkgVillages } from "@/lib/gambut";
+import { KUBU_RAYA_CENTER, KUBU_RAYA_ZOOM, type GambutMapProps } from "./types";
 
 // MapLibre derives its worker URL from import.meta.url, which is not an http URL once
 // bundled, so the worker never starts (and GeoJSON sources never render). Point it at the
@@ -30,31 +30,70 @@ maplibregl.setWorkerUrl(
   new URL("../../node_modules/maplibre-gl/dist/maplibre-gl-worker.mjs", import.meta.url).href,
 );
 
-export interface MapLibreMapProps extends FireMapProps {
+export interface MapLibreMapProps extends GambutMapProps {
   onReady: () => void;
   onFail: (reason: string) => void;
 }
 
-const CONFIDENCE_COLOR: maplibregl.ExpressionSpecification = [
+const STATUS_COLOR: maplibregl.ExpressionSpecification = [
   "match",
-  ["get", "confidence"],
-  "high", "#dc2626",
-  "nominal", "#f97316",
-  "#facc15",
-];
-const BASE_RADIUS: maplibregl.ExpressionSpecification = [
-  "min", 12, ["+", 3, ["sqrt", ["max", ["get", "frp"], 0]]],
+  ["get", "status"],
+  "UNVERIFIED_HOTSPOT",
+  FIRE_STATUS_COLOR.UNVERIFIED_HOTSPOT,
+  "CONFIRMED_FLAMING",
+  FIRE_STATUS_COLOR.CONFIRMED_FLAMING,
+  "SUSPECTED_SMOLDERING",
+  FIRE_STATUS_COLOR.SUSPECTED_SMOLDERING,
+  "CONFIRMED_SMOLDERING",
+  FIRE_STATUS_COLOR.CONFIRMED_SMOLDERING,
+  "EXTINGUISHED",
+  FIRE_STATUS_COLOR.EXTINGUISHED,
+  "#94a3b8",
 ];
 
-const HOME_CAMERA = { center: INITIAL_CENTER, zoom: INITIAL_ZOOM + 0.5, pitch: 40, bearing: -12 };
+const BURN_COLOR: maplibregl.ExpressionSpecification = [
+  "match",
+  ["get", "status"],
+  "CONFIRMED_FLAMING",
+  "#dc2626",
+  "UNVERIFIED_HOTSPOT",
+  "#facc15",
+  "SUSPECTED_SMOLDERING",
+  "#f97316",
+  "CONFIRMED_SMOLDERING",
+  "#f97316",
+  "EXTINGUISHED",
+  "#22c55e",
+  "#dc2626",
+];
+
+const BASE_RADIUS: maplibregl.ExpressionSpecification = [
+  "interpolate",
+  ["linear"],
+  ["get", "frp"],
+  0,
+  5,
+  50,
+  9,
+  100,
+  12,
+];
+
+const HOME_CAMERA = {
+  center: KUBU_RAYA_CENTER,
+  zoom: KUBU_RAYA_ZOOM + 0.5,
+  pitch: 45,
+  bearing: -12,
+};
+
 const PULSE_MS = 1600;
 const GROW_MS = 1400;
+const BLINK_MS = 1100;
 
 export default function MapLibreMap(props: MapLibreMapProps) {
-  const { fires, areas, activeAreaId, drawMode, mapStyle, focus } = props;
+  const { incidents, selectedId, hourOffset, mapStyle } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
-  const drawRef = useRef<TerraDraw | null>(null);
   const appliedStyle = useRef(mapStyle);
   // Bumped every time a style finishes loading and our overlays are (re)installed;
   // data/paint effects depend on it so they re-apply after a style switch.
@@ -78,11 +117,11 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       map = new maplibregl.Map({
         container: containerRef.current!,
         style: getMapStyle(appliedStyle.current).url,
-        // Start zoomed out on the globe; the load handler flies in
-        center: [INITIAL_CENTER[0] - 40, INITIAL_CENTER[1] + 10],
-        zoom: 1.2,
+        // Start further out; the load handler flies in over the peat dome
+        center: KUBU_RAYA_CENTER,
+        zoom: 5,
         maxPitch: 85,
-        attributionControl: { compact: true, customAttribution: FIRMS_ATTRIBUTION },
+        attributionControl: { compact: true, customAttribution: BMKG_ATTRIBUTION },
       });
     } catch (err) {
       cb.current.onFail(err instanceof Error ? err.message : "WebGL unavailable");
@@ -94,51 +133,35 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     map.on("webglcontextlost", () => cb.current.onFail("WebGL context lost"));
     map.on("error", (e) => console.warn("[maplibre]", e.error?.message));
 
-    // Fires for the initial style and again after every setStyle()
     map.on("style.load", () => {
       installOverlays(map, env.current);
-      const draw = createTerraDraw(
-        new TerraDrawMapLibreGLAdapter({ map }),
-        (g) => cb.current.onAreaDrawn(g),
-      );
-      draw.start();
-      draw.setMode(cb.current.drawMode);
-      drawRef.current = draw;
       setStyleVersion((v) => v + 1);
     });
 
-    // Ready as soon as the first style is in and our layers are installed. (The `load` event
-    // also waits for every tile, which can take far longer on slow GPUs/networks.)
+    // Ready as soon as the first style is in and our layers are installed.
     map.once("style.load", () => {
       cb.current.onReady();
-      // The first moveend (when the intro flight lands) reports the viewport
-      map.on("moveend", () => {
-        const b = map.getBounds();
-        cb.current.onViewportChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
-      });
-      map.flyTo({ ...HOME_CAMERA, duration: 4500, curve: 1.6, essential: true });
+      map.flyTo({ ...HOME_CAMERA, duration: 4000, curve: 1.6, essential: true });
     });
 
-    // Layer-scoped handlers survive style switches (matched by layer id at event time)
-    for (const layer of ["fw-fires", "fw-fire-columns"]) {
-      map.on("click", layer, (e) => {
-        const raw = e.features?.[0]?.properties?.fire;
-        if (!raw) return;
-        const fire = JSON.parse(raw) as Fire;
-        cb.current.onFireClick(fire);
-        setOrbit(false);
-        map.flyTo({
-          center: [fire.lng, fire.lat],
-          zoom: Math.max(map.getZoom(), 10.5),
-          pitch: 62,
-          bearing: map.getBearing() + 35,
-          duration: 2600,
-          essential: true,
-        });
+    // Incident clicks (layer-scoped handlers survive style switches)
+    map.on("click", "gw-incidents", (e) => {
+      const raw = e.features?.[0]?.properties?.incident;
+      if (!raw) return;
+      const incident = JSON.parse(raw) as HotspotIncident;
+      cb.current.onSelectIncident(incident.id);
+      setOrbit(false);
+      map.flyTo({
+        center: [incident.originLng, incident.originLat],
+        zoom: Math.max(map.getZoom(), 12),
+        pitch: 58,
+        bearing: map.getBearing() + 30,
+        duration: 2400,
+        essential: true,
       });
-      map.on("mouseenter", layer, () => (map.getCanvas().style.cursor = "pointer"));
-      map.on("mouseleave", layer, () => (map.getCanvas().style.cursor = ""));
-    }
+    });
+    map.on("mouseenter", "gw-incidents", () => (map.getCanvas().style.cursor = "pointer"));
+    map.on("mouseleave", "gw-incidents", () => (map.getCanvas().style.cursor = ""));
 
     // Any manual interaction cancels the orbit
     for (const ev of ["mousedown", "touchstart", "wheel"] as const) {
@@ -146,21 +169,16 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     }
 
     return () => {
-      drawRef.current?.stop();
-      drawRef.current = null;
       map.remove();
       mapRef.current = null;
     };
   }, []);
 
-  // Style switch: Terra Draw must unregister while its layers still exist; everything is
-  // re-installed in the style.load handler.
+  // Style switch: everything is re-installed in the style.load handler
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map || appliedStyle.current === mapStyle) return;
     appliedStyle.current = mapStyle;
-    drawRef.current?.stop();
-    drawRef.current = null;
     map.setStyle(getMapStyle(mapStyle).url, { diff: false });
   }, [mapStyle, ready]);
 
@@ -173,23 +191,129 @@ export default function MapLibreMap(props: MapLibreMapProps) {
   }, [terrain, ready, styleVersion]);
 
   useEffect(() => {
-    if (ready) setVisible(mapRef.current, "fw-buildings", buildings);
+    if (ready) setVisible(mapRef.current, "gw-buildings", buildings);
   }, [buildings, ready, styleVersion]);
 
   useEffect(() => {
-    if (ready) setVisible(mapRef.current, "fw-fire-columns", columns);
+    if (ready) setVisible(mapRef.current, "gw-incident-columns", columns);
   }, [columns, ready, styleVersion]);
 
-  // Pulse animation for high-confidence fires
+  // Incident points + FRP extrusion columns (columns grow from the ground)
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    const points: FeatureCollection = {
+      type: "FeatureCollection",
+      features: incidents.map((i) => ({
+        type: "Feature" as const,
+        geometry: { type: "Point" as const, coordinates: [i.originLng, i.originLat] },
+        properties: {
+          status: i.status,
+          frp: i.frpMegawatt,
+          active:
+            i.status === "CONFIRMED_FLAMING" || i.status === "UNVERIFIED_HOTSPOT",
+          incident: JSON.stringify(i),
+        },
+      })),
+    };
+    const cols: FeatureCollection = {
+      type: "FeatureCollection",
+      features: incidents.map((i) => ({
+        type: "Feature" as const,
+        geometry: squareAround(i.originLng, i.originLat, 0.004),
+        properties: {
+          status: i.status,
+          height: Math.min(8000, 800 + i.frpMegawatt * 80),
+        },
+      })),
+    };
+    map.getSource<GeoJSONSource>("gw-incidents")?.setData(points);
+    map.getSource<GeoJSONSource>("gw-incident-columns")?.setData(cols);
+
+    let raf = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - start) / GROW_MS);
+      const eased = 1 - Math.pow(1 - p, 3);
+      if (map.getLayer("gw-incident-columns")) {
+        map.setPaintProperty("gw-incident-columns", "fill-extrusion-height", [
+          "*",
+          ["get", "height"],
+          eased,
+        ]);
+      }
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [incidents, ready, styleVersion]);
+
+  // Burn polygons (nowcast + forecast of the selected incident) and the firebreak line
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map) return;
+    const selected = incidents.find((i) => i.id === selectedId) ?? incidents[0];
+    const burn: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
+
+    if (selected) {
+      const step =
+        hourOffset === 0
+          ? selected.nowcastPolygon
+          : selected.forecastPolygons.find((p) => p.hourOffset === hourOffset) ??
+            selected.forecastPolygons[selected.forecastPolygons.length - 1];
+
+      if (step) {
+        burn.features.push({
+          ...step.geojsonPolygon,
+          properties: { status: selected.status, isForecast: hourOffset > 0 },
+        });
+      }
+      // Nowcast stays visible as a dimmer base while a forecast hour is selected
+      if (hourOffset > 0) {
+        burn.features.push({
+          ...selected.nowcastPolygon.geojsonPolygon,
+          properties: { status: selected.status, isForecast: false },
+        });
+      }
+
+      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(firebreakLineString(selected.firebreak));
+    } else {
+      map.getSource<GeoJSONSource>("gw-firebreak")?.setData({
+        type: "FeatureCollection",
+        features: [],
+      });
+    }
+    map.getSource<GeoJSONSource>("gw-burn")?.setData(burn);
+  }, [incidents, selectedId, hourOffset, ready, styleVersion]);
+
+  // Pulse ring on active incidents + blink on smoldering polygons
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || !map) return;
     let raf = 0;
     const tick = (now: number) => {
-      if (map.getLayer("fw-fires-pulse")) {
+      if (map.getLayer("gw-incidents-pulse")) {
         const t = (now % PULSE_MS) / PULSE_MS;
-        map.setPaintProperty("fw-fires-pulse", "circle-radius", ["+", BASE_RADIUS, t * 16]);
-        map.setPaintProperty("fw-fires-pulse", "circle-opacity", 0.55 * (1 - t));
+        map.setPaintProperty("gw-incidents-pulse", "circle-radius", ["+", BASE_RADIUS, t * 18]);
+        map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0.5 * (1 - t));
+      }
+      if (map.getLayer("gw-burn-fill")) {
+        // Smoldering polygons blink (suspected/confirmed embers under the surface)
+        const selected = cb.current.incidents.find((i) => i.id === cb.current.selectedId);
+        const smoldering =
+          selected?.status === "SUSPECTED_SMOLDERING" ||
+          selected?.status === "CONFIRMED_SMOLDERING";
+        if (smoldering) {
+          const blink = 0.5 + 0.5 * Math.sin((now / BLINK_MS) * Math.PI * 2);
+          map.setPaintProperty("gw-burn-fill", "fill-opacity", 0.18 + blink * 0.24);
+        } else {
+          map.setPaintProperty("gw-burn-fill", "fill-opacity", [
+            "case",
+            ["get", "isForecast"],
+            0.22,
+            0.35,
+          ]);
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -213,99 +337,23 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     return () => cancelAnimationFrame(raf);
   }, [orbit, ready]);
 
-  // Flatten the camera while drawing so clicks land where expected
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!ready || !map) return;
-    drawRef.current?.setMode(drawMode);
-    if (drawMode !== "static") map.easeTo({ pitch: 0, bearing: 0, duration: 600 });
-  }, [drawMode, ready]);
-
-  // Fire points + extruded columns, with the columns growing from the ground
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!ready || !map) return;
-    const points: FeatureCollection<Point> = {
-      type: "FeatureCollection",
-      features: fires.map((f) => ({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: [f.lng, f.lat] },
-        properties: { confidence: f.confidence, frp: f.frp, fire: JSON.stringify(f) },
-      })),
-    };
-    const cols: FeatureCollection<Polygon> = {
-      type: "FeatureCollection",
-      features: fires.map((f) => ({
-        type: "Feature",
-        geometry: squareAround(f.lng, f.lat, 0.012),
-        properties: {
-          confidence: f.confidence,
-          height: Math.min(60_000, 1_500 + Math.sqrt(Math.max(f.frp, 0)) * 4_000),
-          fire: JSON.stringify(f),
-        },
-      })),
-    };
-    map.getSource<GeoJSONSource>("fw-fires")?.setData(points);
-    map.getSource<GeoJSONSource>("fw-fire-columns")?.setData(cols);
-
-    let raf = 0;
-    const start = performance.now();
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - start) / GROW_MS);
-      const eased = 1 - Math.pow(1 - p, 3);
-      if (map.getLayer("fw-fire-columns")) {
-        map.setPaintProperty("fw-fire-columns", "fill-extrusion-height", [
-          "*", ["get", "height"], eased,
-        ]);
-      }
-      if (p < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [fires, ready, styleVersion]);
-
-  useEffect(() => {
-    if (!ready) return;
-    const fc: FeatureCollection<Polygon> = {
-      type: "FeatureCollection",
-      features: areas.map((a) => ({
-        type: "Feature",
-        geometry: a.geometry,
-        properties: { name: a.name, active: a.id === activeAreaId },
-      })),
-    };
-    mapRef.current?.getSource<GeoJSONSource>("fw-areas")?.setData(fc);
-  }, [areas, activeAreaId, ready, styleVersion]);
-
-  useEffect(() => {
-    if (!focus || !mapRef.current) return;
-    const [w, s, e, n] = focus.bbox;
-    mapRef.current.fitBounds(
-      [
-        [w, s],
-        [e, n],
-      ],
-      { padding: 60, pitch: 45, bearing: -15, duration: 1800 },
-    );
-  }, [focus]);
-
   const toggles = [
     { label: "Globe", icon: GlobeIcon, on: globe, set: setGlobe },
     { label: "Terrain", icon: MountainSnowIcon, on: terrain, set: setTerrain },
-    { label: "Buildings", icon: Building2Icon, on: buildings, set: setBuildings },
-    { label: "Fire columns", icon: BoxIcon, on: columns, set: setColumns },
+    { label: "Bangunan", icon: Building2Icon, on: buildings, set: setBuildings },
+    { label: "Kolum FRP", icon: BoxIcon, on: columns, set: setColumns },
     { label: "Orbit", icon: RotateCwIcon, on: orbit, set: setOrbit },
   ];
 
   return (
     <div className="relative h-full w-full">
-      <div ref={containerRef} className="h-full w-full bg-neutral-950" />
+      <div ref={containerRef} className="h-full w-full bg-slate-950" />
       {ready && (
         <motion.div
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.4 }}
-          className="absolute top-4 left-4 z-10 flex flex-wrap gap-1 rounded-xl border bg-card/80 p-1 backdrop-blur"
+          className="absolute top-3 left-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap gap-1 rounded-xl border border-white/10 bg-slate-950/80 p-1 backdrop-blur"
         >
           {toggles.map(({ label, icon: Icon, on, set }) => (
             <Button
@@ -313,13 +361,10 @@ export default function MapLibreMap(props: MapLibreMapProps) {
               size="sm"
               variant={on ? "default" : "ghost"}
               aria-pressed={on}
-              disabled={label === "Orbit" && drawMode !== "static"}
               onClick={() => {
                 set((v) => !v);
-                // Tilt so relief / buildings are visible (here, not in an effect, so the
-                // intro flight is never cancelled)
                 const map = mapRef.current;
-                const wantsTilt = label === "Terrain" || label === "Buildings";
+                const wantsTilt = label === "Terrain" || label === "Bangunan";
                 if (wantsTilt && !on && map && map.getPitch() < 30) {
                   map.easeTo({ pitch: 55, duration: 1200 });
                 }
@@ -347,8 +392,8 @@ export default function MapLibreMap(props: MapLibreMapProps) {
   );
 }
 
-// Adds terrain, lighting, sky, 3D buildings and all FireWatch data layers on top of the
-// current OpenFreeMap style. Called on every style.load.
+// Adds terrain, lighting, sky, 3D buildings and all GambutWatch data layers on top of
+// the current OpenFreeMap style. Called on every style.load.
 function installOverlays(
   map: maplibregl.Map,
   env: { globe: boolean; terrain: boolean; buildings: boolean; columns: boolean },
@@ -361,7 +406,6 @@ function installOverlays(
     "sky-horizon-blend": 0.5,
     "horizon-fog-blend": 0.4,
     "fog-ground-blend": 0.95,
-    // Subtle halo on the globe; fades out as the camera gets close
     "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 0.45, 6, 0.3, 10, 0],
   });
   // Low sun from the south-west so extrusions and relief get readable shading
@@ -377,7 +421,7 @@ function installOverlays(
   }
   if (style.sources.openmaptiles) {
     map.addLayer({
-      id: "fw-buildings",
+      id: "gw-buildings",
       type: "fill-extrusion",
       source: "openmaptiles",
       "source-layer": "building",
@@ -385,11 +429,24 @@ function installOverlays(
       layout: { visibility: env.buildings ? "visible" : "none" },
       paint: {
         "fill-extrusion-color": [
-          "interpolate", ["linear"], ["coalesce", ["get", "render_height"], 0],
-          0, "#e7e5e4", 50, "#d6d3d1", 150, "#a8a29e",
+          "interpolate",
+          ["linear"],
+          ["coalesce", ["get", "render_height"], 0],
+          0,
+          "#e7e5e4",
+          50,
+          "#d6d3d1",
+          150,
+          "#a8a29e",
         ],
         "fill-extrusion-height": [
-          "interpolate", ["linear"], ["zoom"], 13, 0, 14.5, ["coalesce", ["get", "render_height"], 6],
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          13,
+          0,
+          14.5,
+          ["coalesce", ["get", "render_height"], 6],
         ],
         "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
         "fill-extrusion-opacity": 0.85,
@@ -397,70 +454,113 @@ function installOverlays(
     });
   }
 
-  map.addSource("fw-areas", { type: "geojson", data: emptyFC() });
+  // KHG peatland polygon (context layer)
+  map.addSource("gw-khg", { type: "geojson", data: KHG_SUNGAI_KAPUAS_AMBawang });
   map.addLayer({
-    id: "fw-areas-fill",
+    id: "gw-khg-fill",
     type: "fill",
-    source: "fw-areas",
+    source: "gw-khg",
     paint: {
-      "fill-color": ["case", ["get", "active"], "#0284c7", "#64748b"],
-      "fill-opacity": ["case", ["get", "active"], 0.12, 0.05],
+      "fill-color": "#1a2e05",
+      "fill-opacity": 0.35,
     },
   });
   map.addLayer({
-    id: "fw-areas-line",
+    id: "gw-khg-line",
     type: "line",
-    source: "fw-areas",
+    source: "gw-khg",
     paint: {
-      "line-color": ["case", ["get", "active"], "#0284c7", "#64748b"],
-      "line-width": ["case", ["get", "active"], 3, 1.5],
+      "line-color": "#3f6212",
+      "line-width": 2,
+      "line-dasharray": [3, 2],
     },
   });
 
-  map.addSource("fw-fires", { type: "geojson", data: emptyFC() });
-  map.addSource("fw-fire-columns", { type: "geojson", data: emptyFC() });
-
-  // Heatmap for the zoomed-out overview, fading out as points take over
+  // Villages
+  map.addSource("gw-villages", {
+    type: "geojson",
+    data: {
+      type: "FeatureCollection",
+      features: BmkgVillages.map((v) => ({
+        type: "Feature" as const,
+        geometry: { type: "Point" as const, coordinates: [v.lng, v.lat] },
+        properties: { name: v.name },
+      })),
+    },
+  });
   map.addLayer({
-    id: "fw-fires-heat",
-    type: "heatmap",
-    source: "fw-fires",
-    maxzoom: 9,
+    id: "gw-villages",
+    type: "circle",
+    source: "gw-villages",
     paint: {
-      "heatmap-weight": ["interpolate", ["linear"], ["get", "frp"], 0, 0.15, 50, 1],
-      "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 0, 0.6, 8, 2],
-      "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 0, 4, 5, 14, 8, 24],
-      "heatmap-color": [
-        "interpolate", ["linear"], ["heatmap-density"],
-        0, "rgba(0,0,0,0)",
-        0.2, "rgba(250,204,21,0.35)",
-        0.45, "rgba(249,115,22,0.6)",
-        0.75, "rgba(220,38,38,0.8)",
-        1, "rgba(127,29,29,0.95)",
-      ],
-      "heatmap-opacity": ["interpolate", ["linear"], ["zoom"], 6, 0.8, 9, 0],
+      "circle-color": "#38bdf8",
+      "circle-radius": 4,
+      "circle-stroke-width": 1.5,
+      "circle-stroke-color": "#0f172a",
+    },
+  });
+  // Village names are labeled on the Leaflet fallback map: the OpenFreeMap styles'
+  // glyphs endpoint (fonts/{fontstack}/{range}.pbf) currently 404s, so a symbol
+  // layer here would render nothing and log a warning per codepoint.
+
+  // Burn polygons (nowcast + forecast)
+  map.addSource("gw-burn", { type: "geojson", data: emptyFC() });
+  map.addLayer({
+    id: "gw-burn-fill",
+    type: "fill",
+    source: "gw-burn",
+    paint: {
+      "fill-color": BURN_COLOR,
+      "fill-opacity": ["case", ["get", "isForecast"], 0.22, 0.35],
+    },
+  });
+  map.addLayer({
+    id: "gw-burn-line",
+    type: "line",
+    source: "gw-burn",
+    paint: {
+      "line-color": BURN_COLOR,
+      "line-width": 2,
+      "line-dasharray": [2, 2],
     },
   });
 
+  // Firebreak recommendation line (#FACC15 dashed per prd.md)
+  map.addSource("gw-firebreak", { type: "geojson", data: emptyFC() });
   map.addLayer({
-    id: "fw-fire-columns",
+    id: "gw-firebreak",
+    type: "line",
+    source: "gw-firebreak",
+    paint: {
+      "line-color": "#facc15",
+      "line-width": 3,
+      "line-dasharray": [2, 1.5],
+    },
+  });
+
+  // Incident points + FRP extrusion columns
+  map.addSource("gw-incidents", { type: "geojson", data: emptyFC() });
+  map.addSource("gw-incident-columns", { type: "geojson", data: emptyFC() });
+
+  map.addLayer({
+    id: "gw-incident-columns",
     type: "fill-extrusion",
-    source: "fw-fire-columns",
-    minzoom: 3,
+    source: "gw-incident-columns",
+    minzoom: 9,
     layout: { visibility: env.columns ? "visible" : "none" },
     paint: {
-      "fill-extrusion-color": CONFIDENCE_COLOR,
+      "fill-extrusion-color": STATUS_COLOR,
       "fill-extrusion-height": 0,
-      "fill-extrusion-opacity": 0.85,
+      "fill-extrusion-opacity": 0.7,
     },
   });
 
-  // Expanding ring behind high-confidence detections (radius/opacity animated in a rAF loop)
+  // Expanding ring behind active incidents (radius/opacity animated in a rAF loop)
   map.addLayer({
-    id: "fw-fires-pulse",
+    id: "gw-incidents-pulse",
     type: "circle",
-    source: "fw-fires",
-    filter: ["==", ["get", "confidence"], "high"],
+    source: "gw-incidents",
+    filter: ["==", ["get", "active"], true],
     paint: {
       "circle-color": "#ef4444",
       "circle-radius": BASE_RADIUS,
@@ -470,14 +570,13 @@ function installOverlays(
   });
 
   map.addLayer({
-    id: "fw-fires",
+    id: "gw-incidents",
     type: "circle",
-    source: "fw-fires",
+    source: "gw-incidents",
     paint: {
-      "circle-color": CONFIDENCE_COLOR,
+      "circle-color": STATUS_COLOR,
       "circle-radius": BASE_RADIUS,
-      "circle-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.5, 7, 0.9],
-      "circle-stroke-width": 1,
+      "circle-stroke-width": 1.5,
       "circle-stroke-color": "#ffffff",
     },
   });
@@ -489,7 +588,7 @@ function setVisible(map: maplibregl.Map | null, layerId: string, visible: boolea
   }
 }
 
-function squareAround(lng: number, lat: number, halfDeg: number): Polygon {
+function squareAround(lng: number, lat: number, halfDeg: number): GeoJSON.Polygon {
   // Widen in longitude so the footprint stays roughly square away from the equator
   const dx = halfDeg / Math.max(Math.cos((lat * Math.PI) / 180), 0.2);
   return {
@@ -499,13 +598,13 @@ function squareAround(lng: number, lat: number, halfDeg: number): Polygon {
         [lng - dx, lat - halfDeg],
         [lng + dx, lat - halfDeg],
         [lng + dx, lat + halfDeg],
-        [lng - dx, lat + halfDeg],
+        [lng - dx, lat - halfDeg],
         [lng - dx, lat - halfDeg],
       ],
     ],
   };
 }
 
-function emptyFC(): FeatureCollection {
+function emptyFC(): GeoJSON.FeatureCollection {
   return { type: "FeatureCollection", features: [] };
 }

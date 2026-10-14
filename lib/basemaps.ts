@@ -16,8 +16,8 @@ export function getMapStyle(id: MapStyleId) {
 // OpenStreetMap raster tiles for the Leaflet fallback
 export const OSM_TILES = {
   url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-  attribution: "&copy; OpenStreetMap contributors",
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
   maxZoom: 19,
 };
 
-export const FIRMS_ATTRIBUTION = "Fire data: NASA FIRMS";
+export const BMKG_ATTRIBUTION = "Data cuaca: BMKG";

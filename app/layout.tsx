@@ -13,14 +13,15 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "FireWatch",
-  description: "Active fire monitoring with NASA FIRMS",
+  title: "GambutWatch | Pemantau Kebakaran Gambut Kubu Raya",
+  description:
+    "Tactical Decision Support System perambatan kebakaran lahan gambut dengan nowcast, proyeksi t+12 jam, dan rekomendasi sekat bakar. Data cuaca BMKG.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
-      lang="en"
+      lang="id"
       className={`${geistSans.variable} ${geistMono.variable} dark h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>

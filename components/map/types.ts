@@ -1,23 +1,16 @@
-import type { Polygon } from "geojson";
-import type { BBox, Fire } from "@/lib/fire-types";
-import type { WatchArea } from "@/lib/db";
+import type { HotspotIncident } from "@/lib/gambut";
 import type { MapStyleId } from "@/lib/basemaps";
 
-export type DrawMode = "static" | "polygon" | "rectangle" | "circle" | "freehand";
-
-export interface FireMapProps {
-  fires: Fire[];
-  areas: WatchArea[];
-  activeAreaId: string | null;
-  drawMode: DrawMode;
-  // OpenFreeMap style (MapLibre only; Leaflet always uses OSM raster tiles)
+export interface GambutMapProps {
+  incidents: HotspotIncident[];
+  selectedId: string | null;
+  /** Forecast horizon in hours (0 = nowcast). */
+  hourOffset: number;
+  /** OpenFreeMap style (MapLibre only; Leaflet always uses OSM raster tiles) */
   mapStyle: MapStyleId;
-  // Bumped by the parent to fly the map to a bbox
-  focus: { bbox: BBox; nonce: number } | null;
-  onAreaDrawn: (geometry: Polygon) => void;
-  onViewportChange: (bbox: BBox) => void;
-  onFireClick: (fire: Fire) => void;
+  onSelectIncident: (id: string) => void;
 }
 
-export const INITIAL_CENTER: [number, number] = [118, -2]; // lng, lat — Indonesia
-export const INITIAL_ZOOM = 4;
+/** Center on the KHG Sungai Kapuas - Sungai Ambawang peat dome, Kubu Raya. */
+export const KUBU_RAYA_CENTER: [number, number] = [109.34, -0.245]; // lng, lat
+export const KUBU_RAYA_ZOOM = 11;
