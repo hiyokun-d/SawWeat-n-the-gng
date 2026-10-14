@@ -3,21 +3,25 @@
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import { useEffect, useRef } from "react";
-import type { TerraDraw } from "terra-draw";
-import { TerraDrawLeafletAdapter } from "terra-draw-leaflet-adapter";
-import { FIRMS_ATTRIBUTION, OSM_TILES } from "@/lib/basemaps";
-import { confidenceColor, fireRadius } from "@/lib/fire-types";
-import { createTerraDraw } from "./terra";
-import { INITIAL_CENTER, INITIAL_ZOOM, type FireMapProps } from "./types";
+import { FIRE_STATUS_COLOR, type HotspotIncident } from "@/lib/gambut";
+import { firebreakLineString } from "@/lib/simulationEngine";
+import { OSM_TILES } from "@/lib/basemaps";
+import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
+import { BmkgVillages } from "@/lib/gambut";
+import { KUBU_RAYA_CENTER, KUBU_RAYA_ZOOM, type GambutMapProps } from "./types";
 
-export default function LeafletMap(props: FireMapProps) {
-  const { fires, areas, activeAreaId, drawMode, focus } = props;
+/**
+ * Leaflet fallback engine: raster OSM tiles, no WebGL.
+ * Renders the same GambutWatch layers as the MapLibre engine.
+ */
+export default function LeafletMap(props: GambutMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
-  const drawRef = useRef<TerraDraw | null>(null);
-  const firesLayer = useRef<L.LayerGroup | null>(null);
-  const areasLayer = useRef<L.LayerGroup | null>(null);
-  // Keep latest callbacks without re-creating the map
+  const khgLayer = useRef<L.GeoJSON | null>(null);
+  const incidentLayers = useRef<L.LayerGroup | null>(null);
+  const villageLayer = useRef<L.LayerGroup | null>(null);
+
+  // Latest props without re-creating the map
   const cb = useRef(props);
   useEffect(() => {
     cb.current = props;
@@ -25,94 +29,130 @@ export default function LeafletMap(props: FireMapProps) {
 
   useEffect(() => {
     const map = L.map(containerRef.current!, {
-      preferCanvas: true,
+      preferCanvas: false,
       zoomControl: false,
-    }).setView([INITIAL_CENTER[1], INITIAL_CENTER[0]], INITIAL_ZOOM);
+    }).setView([KUBU_RAYA_CENTER[1], KUBU_RAYA_CENTER[0]], KUBU_RAYA_ZOOM);
     L.control.zoom({ position: "bottomright" }).addTo(map);
     L.tileLayer(OSM_TILES.url, {
       maxZoom: OSM_TILES.maxZoom,
-      attribution: `${OSM_TILES.attribution} | ${FIRMS_ATTRIBUTION}`,
+      attribution: `${OSM_TILES.attribution} | Data cuaca: BMKG`,
     }).addTo(map);
 
-    areasLayer.current = L.layerGroup().addTo(map);
-    firesLayer.current = L.layerGroup().addTo(map);
-
-    const emitViewport = () => {
-      const b = map.getBounds();
-      cb.current.onViewportChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
-    };
-    map.on("moveend", emitViewport);
-    emitViewport();
-
-    const draw = createTerraDraw(
-      new TerraDrawLeafletAdapter({ lib: L, map }),
-      (g) => cb.current.onAreaDrawn(g),
+    // KHG peatland hydrology unit polygon (context layer)
+    khgLayer.current = L.geoJSON(KHG_SUNGAI_KAPUAS_AMBawang as GeoJSON.GeoJsonObject, {
+      interactive: false,
+      style: {
+        color: "#3f6212",
+        weight: 2,
+        dashArray: "6 4",
+        fillColor: "#1a2e05",
+        fillOpacity: 0.35,
+      },
+    }).addTo(map);
+    khgLayer.current.bindTooltip(
+      "KHG Sungai Kapuas - Sungai Ambawang (batas aproksimasi)",
+      { sticky: true },
     );
-    draw.start();
-    draw.setMode("static");
 
+    villageLayer.current = L.layerGroup().addTo(map);
+    for (const v of BmkgVillages) {
+      const pin = L.marker([v.lat, v.lng], {
+        icon: L.divIcon({
+          className: "",
+          html: `<div style="display:flex;flex-direction:column;align-items:center">
+            <div style="width:10px;height:10px;border-radius:9999px;background:#38bdf8;border:2px solid #0f172a"></div>
+            <span style="font-size:10px;color:#93c5fd;text-shadow:0 1px 2px #000;margin-top:2px;white-space:nowrap">${v.name}</span>
+          </div>`,
+          iconSize: [90, 34],
+          iconAnchor: [45, 6],
+        }),
+      });
+      pin.addTo(villageLayer.current);
+    }
+
+    incidentLayers.current = L.layerGroup().addTo(map);
     mapRef.current = map;
-    drawRef.current = draw;
+
     return () => {
-      draw.stop();
       map.remove();
       mapRef.current = null;
-      drawRef.current = null;
+      khgLayer.current = null;
+      incidentLayers.current = null;
+      villageLayer.current = null;
     };
   }, []);
 
   useEffect(() => {
-    drawRef.current?.setMode(drawMode);
-  }, [drawMode]);
-
-  useEffect(() => {
-    const layer = firesLayer.current;
-    if (!layer) return;
+    const layer = incidentLayers.current;
+    const map = mapRef.current;
+    if (!layer || !map) return;
     layer.clearLayers();
-    for (const f of fires) {
-      L.circleMarker([f.lat, f.lng], {
-        radius: fireRadius(f.frp),
-        color: confidenceColor(f.confidence),
-        fillColor: confidenceColor(f.confidence),
-        fillOpacity: 0.75,
-        weight: 1,
+
+    const { incidents, selectedId, hourOffset } = cb.current;
+    const selected = incidents.find((i) => i.id === selectedId) ?? incidents[0] ?? null;
+
+    for (const incident of incidents) {
+      const isSelected = incident.id === selected?.id;
+      const statusColor = FIRE_STATUS_COLOR[incident.status];
+      const smoldering =
+        incident.status === "SUSPECTED_SMOLDERING" ||
+        incident.status === "CONFIRMED_SMOLDERING";
+
+      L.circleMarker([incident.originLat, incident.originLng], {
+        radius: isSelected ? 8 : 5,
+        color: statusColor,
+        fillColor: statusColor,
+        fillOpacity: 1,
+        weight: 2,
+        className: smoldering ? "smolder-blink" : undefined,
       })
-        .on("click", () => cb.current.onFireClick(f))
+        .bindTooltip(`${incident.id} · FRP ${incident.frpMegawatt} MW`, { sticky: true })
+        .on("click", () => cb.current.onSelectIncident(incident.id))
         .addTo(layer);
-    }
-  }, [fires]);
 
-  useEffect(() => {
-    const layer = areasLayer.current;
-    if (!layer) return;
-    layer.clearLayers();
-    for (const a of areas) {
-      const active = a.id === activeAreaId;
-      L.geoJSON(a.geometry, {
+      if (!isSelected) continue;
+
+      const step =
+        hourOffset === 0
+          ? incident.nowcastPolygon
+          : incident.forecastPolygons.find((p) => p.hourOffset === hourOffset) ??
+            incident.forecastPolygons[incident.forecastPolygons.length - 1];
+
+      if (step) {
+        L.geoJSON(step.geojsonPolygon as GeoJSON.GeoJsonObject, {
+          interactive: false,
+          style: {
+            color: smoldering ? "#fb923c" : "#ef4444",
+            weight: 2,
+            dashArray: "3 3",
+            fillColor: smoldering ? "#f97316" : "#dc2626",
+            fillOpacity: 0.35,
+            className: smoldering ? "smolder-blink" : undefined,
+          },
+        }).addTo(layer);
+      }
+
+      const fb = firebreakLineString(incident.firebreak);
+      L.geoJSON(fb as GeoJSON.GeoJsonObject, {
         interactive: false,
         style: {
-          color: active ? "#38bdf8" : "#94a3b8",
-          weight: active ? 3 : 1.5,
-          dashArray: active ? undefined : "4 4",
-          fillOpacity: active ? 0.08 : 0.03,
+          color: "#facc15",
+          weight: 3,
+          dashArray: "10 6",
+          fillOpacity: 0,
         },
       })
-        .bindTooltip(a.name, { permanent: active, direction: "center" })
+        .bindTooltip("REKOMENDASI SEKAT BAKAR (POTONG DI SINI)", { sticky: true })
         .addTo(layer);
     }
-  }, [areas, activeAreaId]);
 
-  useEffect(() => {
-    if (!focus || !mapRef.current) return;
-    const [w, s, e, n] = focus.bbox;
-    mapRef.current.flyToBounds(
-      [
-        [s, w],
-        [n, e],
-      ],
-      { padding: [40, 40], duration: 0.8 },
-    );
-  }, [focus]);
+    // Fit the selected incident into view
+    if (selected) {
+      map.setView([selected.originLat, selected.originLng], Math.max(map.getZoom(), 12), {
+        animate: true,
+      });
+    }
+  }, [props.incidents, props.selectedId, props.hourOffset]);
 
-  return <div ref={containerRef} className="h-full w-full bg-neutral-900" />;
+  return <div ref={containerRef} className="h-full w-full bg-slate-950" />;
 }
