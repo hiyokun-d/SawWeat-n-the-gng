@@ -5,7 +5,9 @@ import { PauseIcon, PlayIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 
-export const TIMELINE_HOURS = [0, 1, 3, 6, 9, 12] as const;
+export const TIMELINE_HOURS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] as const;
+/** Hours with a quick-jump chip; the slider reaches every hour. */
+const CHIP_HOURS = [0, 1, 3, 6, 9, 12];
 
 export interface TimelineSliderProps {
   /** Currently selected hour offset (0 = nowcast). */
@@ -34,7 +36,7 @@ export default function TimelineSlider({
     setPlaying(false);
   }, []);
 
-  // Auto-play: step through the timeline every 1.2 s, then stop at the end
+  // Auto-play: one forecast hour every 0.7 s so the spread reads as motion, then stop
   useEffect(() => {
     if (!playing) return;
     let index = TIMELINE_HOURS.indexOf(hourOffset as (typeof TIMELINE_HOURS)[number]);
@@ -47,7 +49,7 @@ export default function TimelineSlider({
       }
       index += 1;
       onChange(next);
-    }, 1200);
+    }, 700);
     return stop;
   }, [playing, hourOffset, onChange, stop]);
 
@@ -61,7 +63,12 @@ export default function TimelineSlider({
       <Button
         size="icon"
         variant={playing ? "secondary" : "default"}
-        onClick={() => (playing ? stop() : setPlaying(true))}
+        onClick={() => {
+          if (playing) return stop();
+          // Replay from the start when already at the end
+          if (hourOffset === TIMELINE_HOURS[TIMELINE_HOURS.length - 1]) onChange(0);
+          setPlaying(true);
+        }}
         aria-label={playing ? "Jeda animasi" : "Putar animasi perambatan"}
         className="shrink-0 self-start sm:self-auto"
       >
@@ -75,6 +82,7 @@ export default function TimelineSlider({
           </span>
           <input
             type="range"
+            aria-valuetext={hourOffset === 0 ? "sekarang" : `${hourOffset} jam ke depan`}
             min={0}
             max={TIMELINE_HOURS.length - 1}
             step={1}
@@ -85,7 +93,7 @@ export default function TimelineSlider({
           />
         </div>
         <div className="flex flex-wrap gap-1">
-          {TIMELINE_HOURS.map((h) => (
+          {CHIP_HOURS.map((h) => (
             <button
               key={h}
               type="button"

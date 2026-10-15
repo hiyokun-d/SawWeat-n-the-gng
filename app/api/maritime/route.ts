@@ -23,10 +23,11 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  const started = Date.now();
   try {
     const res = await fetch(
       `https://maritim.bmkg.go.id/marine2026-data/perairan/${code}.json`,
-      { cache: "no-store" },
+      { cache: "no-store", signal: AbortSignal.timeout(8_000) },
     );
     if (!res.ok) {
       return Response.json(
@@ -66,6 +67,7 @@ export async function GET(request: NextRequest) {
     }
 
     const windFromDeg = windFromNameToDeg(current.wind_from);
+    const upstreamMs = Date.now() - started;
     return Response.json({
       ok: true,
       code: marine.code,
@@ -93,7 +95,7 @@ export async function GET(request: NextRequest) {
         windVectorDeg: windVectorDeg(windFromDeg),
       },
       attribution: "BMKG",
-    });
+    }, { headers: { "x-upstream-ms": String(upstreamMs) } });
   } catch (err) {
     return Response.json(
       { ok: false, error: err instanceof Error ? err.message : "Gagal menghubungi BMKG maritim" },

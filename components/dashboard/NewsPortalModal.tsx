@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { NewsArticle } from "@/app/api/news/route";
+import type { NewsArticle } from "@/lib/news";
 import { wibTime } from "@/lib/gambut";
 
 export interface NewsPortalModalProps {

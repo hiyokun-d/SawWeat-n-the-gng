@@ -4,6 +4,8 @@
  * the simulation engine, and the BMKG API routes share one source of truth.
  */
 
+import { z } from "zod";
+
 export type FireStatus =
   | "UNVERIFIED_HOTSPOT"
   | "CONFIRMED_FLAMING"
@@ -20,12 +22,27 @@ export interface WeatherTelemetry {
   relativeHumidity: number;
   temperatureC: number;
   updatedAt: string;
+  /** Rain over the last/current interval (mm per hour), when the provider reports it. */
+  precipitationMmH?: number;
+  /** Provider forecast ahead of `updatedAt`, oldest first; drives the spread forecast. */
+  forecast?: WeatherForecastStep[];
+}
+
+/** One forecast slot from BMKG (3-hourly) or Open-Meteo (hourly). */
+export interface WeatherForecastStep {
+  /** Start of the slot, ISO UTC. */
+  at: string;
+  windSpeedKmh: number;
+  windDirectionDeg: number;
+  relativeHumidity: number;
+  temperatureC: number;
+  precipitationMmH: number;
 }
 
 export interface PeatlandZone {
   khgId: string;
   name: string;
-  depthCategory: "DANGKAL (<1m)" | "SEDANG (1-3m)" | "DALAM (>3m)";
+  depthCategory: "DANGKAL (<1m)" | "SEDANG (1-3m)" | "DALAM (>3m)" | "TIDAK TERPETAKAN";
   baseSpreadRateR0: number;
 }
 
@@ -60,6 +77,7 @@ export interface HotspotIncident {
   nowcastPolygon: TimeStepPolygon;
   forecastPolygons: TimeStepPolygon[];
   firebreak: FirebreakRecommendation;
+  /** Null where no settlement data is available yet (looked up on selection). */
   nearestVillage: {
     name: string;
     lat: number;
@@ -67,9 +85,19 @@ export interface HotspotIncident {
     distanceMeters: number;
     threatLevel: ThreatLevel;
     safeEvacuationBearingDeg: number;
-  };
+    /** Minutes until the forecast spread reaches the village (Infinity past the forecast). */
+    etaMinutes: number;
+    population?: number;
+  } | null;
+  /** Inside Indonesia: the app's focus area. */
+  inIndonesia: boolean;
   lastVerifiedBy?: string;
   lastVerifiedAt?: string;
+  /** Satellites that saw this fire in the query window (fused FIRMS sources). */
+  satellites: string[];
+  /** Number of FIRMS pixels fused into this incident. */
+  detectionCount: number;
+  firstDetectedAt: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +121,40 @@ export const BmkgVillages: BmkgVillage[] = [
   { adm4: "61.12.07.2006", name: "Pematang Tujuh", lat: -0.2281124133, lng: 109.2760432196 },
 ];
 
+/**
+ * FIRMS near-real-time datasets with global coverage, all queried and merged.
+ * `globalFile` is the public rolling-24h world file under
+ * firms.modaps.eosdis.nasa.gov/data/active_fire/ (no key needed).
+ */
+export const FIRMS_SOURCES = [
+  {
+    id: "VIIRS_SNPP_NRT",
+    label: "VIIRS S-NPP",
+    globalFile: "suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Global_24h.csv",
+  },
+  {
+    id: "VIIRS_NOAA20_NRT",
+    label: "VIIRS NOAA-20",
+    globalFile: "noaa-20-viirs-c2/csv/J1_VIIRS_C2_Global_24h.csv",
+  },
+  {
+    id: "VIIRS_NOAA21_NRT",
+    label: "VIIRS NOAA-21",
+    globalFile: "noaa-21-viirs-c2/csv/J2_VIIRS_C2_Global_24h.csv",
+  },
+  // One dataset, two satellites: the CSV satellite column says Terra or Aqua
+  {
+    id: "MODIS_NRT",
+    label: "MODIS Terra/Aqua",
+    globalFile: "modis-c6.1/csv/MODIS_C6_1_Global_24h.csv",
+  },
+] as const;
+// LANDSAT_NRT and GOES_NRT are left out on purpose: FIRMS only publishes
+// them for the Americas (LANDSAT_NRT for the US and Canada), so they would
+// add no detections over Indonesia and only partial ones elsewhere.
+
+export type FirmsSourceId = (typeof FIRMS_SOURCES)[number]["id"];
+
 export interface FirePoint {
   id: string;
   lat: number;
@@ -102,19 +164,52 @@ export interface FirePoint {
   confidence: "low" | "nominal" | "high";
   /** Detection time, ISO UTC (FIRMS acquisition date + time). */
   acquiredAt: string;
+  /** Satellite display name, e.g. "NOAA-20" or "Aqua". */
   satellite: string;
+  source: FirmsSourceId;
   daynight: "D" | "N";
 }
 
 /**
- * Bounding box (west, south, east, north) around the KHG Sungai Kapuas -
- * Sungai Ambawang peat dome and the six Rasau Jaya villages, used for the
- * FIRMS area query. Wider than the KHG polygon so border fires are caught.
+ * Fire event fused from every FIRMS pixel within ~1 km of each other,
+ * whichever satellite saw them. Status is derived from the observation
+ * history, see `deriveHotspotStatus` in lib/firms.ts.
  */
-export const FIRMS_BBOX = [109.15, -0.35, 109.55, -0.12] as const;
+export interface FusedHotspot {
+  id: string;
+  /** FRP-weighted centroid of the fused pixels. */
+  lat: number;
+  lng: number;
+  maxFrpMegawatt: number;
+  confidence: "low" | "nominal" | "high";
+  firstSeen: string;
+  lastSeen: string;
+  detectionCount: number;
+  satellites: string[];
+  status: Extract<FireStatus, "UNVERIFIED_HOTSPOT" | "CONFIRMED_FLAMING" | "SUSPECTED_SMOLDERING">;
+  /** Inside Indonesia's land boundary: the app's focus, drawn larger on the map. */
+  inIndonesia: boolean;
+  /** Inside the mapped KHG Sungai Kapuas - Sungai Ambawang polygon. */
+  insideKhg: boolean;
+  /** Nearest named settlement (OpenStreetMap), where settlement data is loaded. */
+  nearestSettlement: Settlement | null;
+}
 
-/** FIRMS near-real-time satellite sources, queried in order and merged. */
-export const FIRMS_SOURCES = ["VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT"] as const;
+export interface Settlement {
+  name: string;
+  lat: number;
+  lng: number;
+  /** Kemendagri village code (OSM `ref`), which is also BMKG's forecast key. */
+  adm4?: string;
+  /** Residents from the OSM `population` tag, where mappers recorded it. */
+  population?: number;
+}
+
+/** Region whose villages are preloaded from OpenStreetMap (west, south, east, north). */
+export const SETTLEMENT_BBOX = [107.7, -3.4, 114.5, 2.4] as const;
+
+/** Days of keyed FIRMS history pulled for Indonesia (API maximum is 5); the world gets 24 h. */
+export const FIRMS_INDONESIA_DAYS = 3;
 
 /** NASA FIRMS requires attribution on every surface that shows their data. */
 export const FIRMS_ATTRIBUTION =
@@ -127,21 +222,113 @@ export const DEFAULT_ADM4 = "61.12.07.2001";
 /* API response schemas (zod)                                         */
 /* ------------------------------------------------------------------ */
 
-/** Response of GET /api/firms (NASA FIRMS area proxy). */
-export const FirmsApiResponseSchema = z.object({
-  configured: z.boolean(),
-  fires: z.array(
+/**
+ * Fused hotspots as columns, so ~100k fires worldwide stay a few MB.
+ * Times are minutes after `baseTime`; `sats` is a bitmask over
+ * `satelliteNames`; `flags` bit 0 = in Indonesia, bit 1 = inside the KHG.
+ */
+export const HotspotTableSchema = z.object({
+  baseTime: z.string(),
+  satelliteNames: z.array(z.string()),
+  ids: z.array(z.string()),
+  lat: z.array(z.number()),
+  lng: z.array(z.number()),
+  frp: z.array(z.number()),
+  conf: z.array(z.number()),
+  status: z.array(z.number()),
+  first: z.array(z.number()),
+  last: z.array(z.number()),
+  count: z.array(z.number()),
+  sats: z.array(z.number()),
+  flags: z.array(z.number()),
+  /** Nearest settlement per hotspot id, only where settlement data is loaded. */
+  settlements: z.record(
+    z.string(),
     z.object({
-      id: z.string(),
+      name: z.string(),
       lat: z.number(),
       lng: z.number(),
-      frpMegawatt: z.number(),
-      confidence: z.enum(["low", "nominal", "high"]),
-      acquiredAt: z.string(),
-      satellite: z.string(),
-      daynight: z.enum(["D", "N"]),
+      adm4: z.string().optional(),
+      population: z.number().optional(),
     }),
   ),
+});
+
+export type HotspotTable = z.infer<typeof HotspotTableSchema>;
+
+export const HOTSPOT_CONFIDENCES = ["low", "nominal", "high"] as const;
+export const HOTSPOT_STATUSES = [
+  "UNVERIFIED_HOTSPOT",
+  "CONFIRMED_FLAMING",
+  "SUSPECTED_SMOLDERING",
+] as const satisfies readonly FusedHotspot["status"][];
+
+export function encodeHotspots(hotspots: FusedHotspot[], baseTime: string): HotspotTable {
+  const baseMs = Date.parse(baseTime);
+  const satelliteNames = [...new Set(hotspots.flatMap((h) => h.satellites))].sort();
+  const minutes = (iso: string) => Math.round((Date.parse(iso) - baseMs) / 60_000);
+  const round = (n: number, d: number) => Math.round(n * 10 ** d) / 10 ** d;
+  const table: HotspotTable = {
+    baseTime,
+    satelliteNames,
+    ids: [], lat: [], lng: [], frp: [], conf: [], status: [],
+    first: [], last: [], count: [], sats: [], flags: [],
+    settlements: {},
+  };
+  for (const h of hotspots) {
+    table.ids.push(h.id);
+    table.lat.push(round(h.lat, 4));
+    table.lng.push(round(h.lng, 4));
+    table.frp.push(h.maxFrpMegawatt);
+    table.conf.push(HOTSPOT_CONFIDENCES.indexOf(h.confidence));
+    table.status.push(HOTSPOT_STATUSES.indexOf(h.status));
+    table.first.push(minutes(h.firstSeen));
+    table.last.push(minutes(h.lastSeen));
+    table.count.push(h.detectionCount);
+    table.sats.push(h.satellites.reduce((m, s) => m | (1 << satelliteNames.indexOf(s)), 0));
+    table.flags.push((h.inIndonesia ? 1 : 0) | (h.insideKhg ? 2 : 0));
+    if (h.nearestSettlement) table.settlements[h.id] = h.nearestSettlement;
+  }
+  return table;
+}
+
+export function decodeHotspots(t: HotspotTable): FusedHotspot[] {
+  const baseMs = Date.parse(t.baseTime);
+  const iso = (min: number) => new Date(baseMs + min * 60_000).toISOString();
+  return t.ids.map((id, i) => ({
+    id,
+    lat: t.lat[i],
+    lng: t.lng[i],
+    maxFrpMegawatt: t.frp[i],
+    confidence: HOTSPOT_CONFIDENCES[t.conf[i]] ?? "nominal",
+    status: HOTSPOT_STATUSES[t.status[i]] ?? "UNVERIFIED_HOTSPOT",
+    firstSeen: iso(t.first[i]),
+    lastSeen: iso(t.last[i]),
+    detectionCount: t.count[i],
+    satellites: t.satelliteNames.filter((_, b) => (t.sats[i] & (1 << b)) !== 0),
+    inIndonesia: (t.flags[i] & 1) !== 0,
+    insideKhg: (t.flags[i] & 2) !== 0,
+    nearestSettlement: t.settlements[id] ?? null,
+  }));
+}
+
+export const FirmsSourceStatusSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  ok: z.boolean(),
+  detections: z.number(),
+});
+
+export type FirmsSourceStatus = z.infer<typeof FirmsSourceStatusSchema>;
+
+/** Response of GET /api/firms (NASA FIRMS area proxy). */
+export const FirmsApiResponseSchema = z.object({
+  ok: z.boolean(),
+  /** True when MAP_KEY is set, so Indonesia also gets multi-day history. */
+  keyed: z.boolean(),
+  hotspots: HotspotTableSchema.nullish(),
+  detections: z.number().default(0),
+  sources: z.array(FirmsSourceStatusSchema).default([]),
   attribution: z.string().nullish(),
   reason: z.string().nullish(),
   fetchedAt: z.string().nullish(),
@@ -158,8 +345,6 @@ export const BMKG_ATTRIBUTION = "Sumber data: BMKG (Badan Meteorologi, Klimatolo
 /* ------------------------------------------------------------------ */
 /* BMKG response schemas (zod)                                         */
 /* ------------------------------------------------------------------ */
-
-import { z } from "zod";
 
 export const BmkgLocationSchema = z.object({
   adm1: z.string(),
@@ -186,6 +371,8 @@ export const BmkgForecastEntrySchema = z.object({
   weather_desc: z.string(),
   weather_desc_en: z.string(),
   analysis_date: z.string(),
+  /** Precipitation in the 3-hour slot (mm). */
+  tp: z.number().nullish(),
 });
 
 export const BmkgWeatherResponseSchema = z.object({
@@ -232,6 +419,15 @@ export type BmkgMarineEntry = z.infer<typeof BmkgMarineEntrySchema>;
 /* API response contracts (shared with the API routes)                 */
 /* ------------------------------------------------------------------ */
 
+export const WeatherForecastStepSchema = z.object({
+  at: z.string(),
+  windSpeedKmh: z.number(),
+  windDirectionDeg: z.number(),
+  relativeHumidity: z.number(),
+  temperatureC: z.number(),
+  precipitationMmH: z.number(),
+});
+
 export const WeatherTelemetrySchema = z.object({
   windSpeedKmh: z.number(),
   windDirectionDeg: z.number(),
@@ -239,9 +435,25 @@ export const WeatherTelemetrySchema = z.object({
   relativeHumidity: z.number(),
   temperatureC: z.number(),
   updatedAt: z.string(),
+  precipitationMmH: z.number().optional(),
+  forecast: z.array(WeatherForecastStepSchema).optional(),
 });
 
-export const WEATHER_SOURCES = ["open-meteo", "bmkg", "fallback"] as const;
+/** Response of GET /api/weather/grid: weather per fire area. */
+export const WeatherGridResponseSchema = z.object({
+  ok: z.literal(true),
+  cells: z.array(
+    z.object({
+      key: z.string(),
+      source: z.enum(["bmkg", "open-meteo"]),
+      /** BMKG village the forecast belongs to, when BMKG answered. */
+      place: z.string().nullish(),
+      telemetry: WeatherTelemetrySchema,
+    }),
+  ),
+});
+
+export const WEATHER_SOURCES = ["bmkg", "open-meteo"] as const;
 export type WeatherSource = (typeof WEATHER_SOURCES)[number];
 
 export const WeatherApiResponseSchema = z.object({
@@ -379,9 +591,23 @@ export const FIRE_STATUS_COLOR: Record<FireStatus, string> = {
   UNVERIFIED_HOTSPOT: "#facc15",
   CONFIRMED_FLAMING: "#ef4444",
   SUSPECTED_SMOLDERING: "#f97316",
-  CONFIRMED_SMOLDERING: "#f97316",
+  // Darker than suspected so a field-confirmed ember reads apart from a satellite guess
+  CONFIRMED_SMOLDERING: "#c2410c",
   EXTINGUISHED: "#22c55e",
 };
+
+/** Every status, most urgent first: drives list order, counters and the legend. */
+export const FIRE_STATUS_ORDER: FireStatus[] = [
+  "CONFIRMED_FLAMING",
+  "CONFIRMED_SMOLDERING",
+  "SUSPECTED_SMOLDERING",
+  "UNVERIFIED_HOTSPOT",
+  "EXTINGUISHED",
+];
+
+export function isSmoldering(status: FireStatus): boolean {
+  return status === "SUSPECTED_SMOLDERING" || status === "CONFIRMED_SMOLDERING";
+}
 
 export const THREAT_COLOR: Record<ThreatLevel, string> = {
   AMAN: "#22c55e",
@@ -405,4 +631,69 @@ export function wibTime(iso: string): string {
   const hh = String(wib.getUTCHours()).padStart(2, "0");
   const mm = String(wib.getUTCMinutes()).padStart(2, "0");
   return `${hh}.${mm} WIB`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Air quality (Open-Meteo Air Quality API, CAMS model)                */
+/* ------------------------------------------------------------------ */
+
+export const AirQualitySchema = z.object({
+  at: z.string(),
+  usAqi: z.number().nullable(),
+  pm25: z.number().nullable(),
+  pm10: z.number().nullable(),
+  /** Carbon monoxide, microgram per cubic meter. */
+  co: z.number().nullable(),
+  /** Aerosol optical depth: how much the smoke column dims sunlight. */
+  aod: z.number().nullable(),
+  /** Hourly forecast ahead (first entry = now). */
+  forecast: z.array(z.object({ at: z.string(), usAqi: z.number().nullable(), pm25: z.number().nullable() })),
+});
+
+export type AirQuality = z.infer<typeof AirQualitySchema>;
+
+export const AirGridResponseSchema = z.object({
+  ok: z.literal(true),
+  cells: z.array(z.object({ key: z.string(), air: AirQualitySchema })),
+});
+
+export interface AqiBand {
+  max: number;
+  label: string;
+  color: string;
+  advice: string;
+}
+
+/** US AQI bands with Indonesian labels and field advice. */
+export const AQI_BANDS: AqiBand[] = [
+  { max: 50, label: "Baik", color: "#22c55e", advice: "Udara aman untuk aktivitas luar." },
+  { max: 100, label: "Sedang", color: "#eab308", advice: "Kelompok sensitif kurangi aktivitas berat di luar." },
+  {
+    max: 150,
+    label: "Tidak sehat (sensitif)",
+    color: "#f97316",
+    advice: "Anak, lansia, ibu hamil dan penderita ISPA pakai masker dan batasi waktu di luar.",
+  },
+  {
+    max: 200,
+    label: "Tidak sehat",
+    color: "#ef4444",
+    advice: "Semua warga pakai masker N95; regu lapangan rotasi dan sediakan posko kesehatan.",
+  },
+  {
+    max: 300,
+    label: "Sangat tidak sehat",
+    color: "#a855f7",
+    advice: "Tutup sekolah, siapkan ruang udara bersih; pindahkan kelompok rentan menjauhi asap.",
+  },
+  {
+    max: Number.POSITIVE_INFINITY,
+    label: "Berbahaya",
+    color: "#9f1239",
+    advice: "Evakuasi kelompok rentan keluar jalur asap; regu hanya dengan pelindung pernapasan.",
+  },
+];
+
+export function aqiBand(usAqi: number): AqiBand {
+  return AQI_BANDS.find((b) => usAqi <= b.max) ?? AQI_BANDS[AQI_BANDS.length - 1];
 }

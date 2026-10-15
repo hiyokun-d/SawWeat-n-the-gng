@@ -2,23 +2,38 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AirGridResponseSchema,
+  decodeHotspots,
+  type AirQuality,
   DEFAULT_ADM4,
+  FIRE_STATUS_ORDER,
   FirmsApiResponseSchema,
   MaritimeApiResponseSchema,
+  SETTLEMENT_BBOX,
   toFireStatus,
   WeatherApiResponseSchema,
+  WeatherGridResponseSchema,
   type FireStatus,
-  type FirePoint,
+  type FirmsSourceStatus,
+  type FusedHotspot,
   type HotspotIncident,
+  type Settlement,
+  type ThreatLevel,
   type WeatherSource,
   type WeatherTelemetry,
 } from "@/lib/gambut";
-import { fallbackWeather, firePointToSource, type HotspotSource } from "@/data/hotspotSource";
+import { hotspotToSource, type HotspotSource } from "@/data/hotspotSource";
+import { reportFeed, trackedJson } from "@/lib/apiHealth";
 import {
   computeFirebreak,
-  computeNearestVillage,
+  computeVillageThreat,
   simulateSpread,
+  smokePlume,
+  stepPolygonFor,
 } from "@/lib/simulationEngine";
+import { circle } from "@turf/turf";
+import type { Region } from "@/lib/geocode";
+import type { NewsArticle } from "@/lib/news";
 import {
   loadPersistedStatuses,
   persistStatuses,
@@ -38,118 +53,292 @@ export interface MaritimeConditions {
   windVectorDeg: number;
 }
 
+/** west, south, east, north */
+export type Bbox = [number, number, number, number];
+
 type StatusMap = Record<string, { status: FireStatus; verifiedBy?: string; verifiedAt?: string }>;
 
-type IncidentGeometry = Pick<
-  HotspotIncident,
-  "nowcastPolygon" | "forecastPolygons" | "firebreak" | "nearestVillage"
->;
+/** Which fires the map and list show. Counters in the top bar always count everything. */
+export interface HotspotFilter {
+  statuses: FireStatus[];
+  region: "indonesia" | "all";
+  /** Only fires seen within this many hours; null = the whole data window. */
+  maxAgeHours: number | null;
+}
 
-// Polygons only depend on the source hotspot and the weather, not on the
-// verification status, so a status change (HUD button) reuses them.
+export const DEFAULT_FILTER: HotspotFilter = {
+  statuses: [...FIRE_STATUS_ORDER],
+  region: "all",
+  maxAgeHours: null,
+};
+
+/** Fires seen within this many hours pulse on the map. */
+export const FRESH_HOURS = 3;
+
+/** Hotspot with the status operators see (satellite-derived, or a newer field verification). */
+export type MapHotspot = FusedHotspot & { effectiveStatus: FireStatus; fresh: boolean };
+
+interface CellWeather {
+  source: "bmkg" | "open-meteo";
+  place?: string | null;
+  telemetry: WeatherTelemetry;
+}
+
+/** Fires simulated at once: the most urgent ones in view (spread polygons are per-fire work). */
+const ACTIVE_LIMIT = 150;
+/** Fires whose danger and smoke zones get a WorldPop headcount (one request per zone). */
+const POPULATION_LIMIT = 20;
+/** A village further than this is not "the village this fire threatens". */
+const VILLAGE_MAX_KM = 30;
+/** Danger zone = the +12 h spread reach plus this buffer, where residents must be ready to move. */
+export const DANGER_BUFFER_M = 2_000;
+/** Weather is fetched per 0.5-degree area (about 55 km) around each simulated fire. */
+const CELL_DEG = 0.5;
+const MAX_CELLS_PER_REQUEST = 80;
+
+const THREAT_RANK: Record<ThreatLevel, number> = { BAHAYA: 0, SIAGA: 1, WASPADA: 2, AMAN: 3 };
+
+export function cellKey(lat: number, lng: number): string {
+  const c = (v: number) => (Math.floor(v / CELL_DEG) * CELL_DEG + CELL_DEG / 2).toFixed(2);
+  return `${c(lat)},${c(lng)}`;
+}
+
+function inBbox(h: { lat: number; lng: number }, [w, s, e, n]: Bbox): boolean {
+  // A view crossing the antimeridian has w > e
+  const lngIn = w <= e ? h.lng >= w && h.lng <= e : h.lng >= w || h.lng <= e;
+  return lngIn && h.lat >= s && h.lat <= n;
+}
+
+/**
+ * Status shown for a fire: a field verification wins until a satellite
+ * sees the fire again after it (prd.md: a new hotspot reopens the incident).
+ */
+function effectiveStatus(h: FusedHotspot, entry: StatusMap[string] | undefined): FireStatus {
+  if (!entry) return h.status;
+  if (entry.verifiedAt && Date.parse(entry.verifiedAt) < Date.parse(h.lastSeen)) return h.status;
+  return entry.status;
+}
+
+function priority(h: MapHotspot): number[] {
+  return [h.inIndonesia ? 0 : 1, FIRE_STATUS_ORDER.indexOf(h.effectiveStatus), -h.maxFrpMegawatt];
+}
+
+function compareRank(a: number[], b: number[]): number {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+// Polygons depend only on the source and its weather, not on the verification
+// status, so a status change (HUD button) reuses them.
 const geometryCache = new WeakMap<
   HotspotSource,
-  { weather: WeatherTelemetry; geometry: IncidentGeometry }
+  {
+    weather: WeatherTelemetry;
+    village: Settlement | null;
+    geometry: Pick<HotspotIncident, "nowcastPolygon" | "forecastPolygons" | "firebreak" | "nearestVillage">;
+  }
 >();
-
-function incidentGeometry(source: HotspotSource, weather: WeatherTelemetry): IncidentGeometry {
-  const cached = geometryCache.get(source);
-  if (cached && cached.weather === weather) return cached.geometry;
-
-  const now = new Date();
-  const simInput = {
-    originLat: source.originLat,
-    originLng: source.originLng,
-    satelliteAcquisitionTime: source.satelliteAcquisitionTime,
-    weather,
-    peatlandInfo: source.peatlandInfo,
-  };
-  const sim = simulateSpread(simInput, now);
-  const firebreak = computeFirebreak(simInput, now);
-  const nearestVillage = computeNearestVillage(
-    source.originLat,
-    source.originLng,
-    weather.windDirectionDeg,
-    now,
-    source.satelliteAcquisitionTime,
-    source.peatlandInfo,
-    weather,
-    sim.headRate,
-  );
-
-  const geometry: IncidentGeometry = {
-    nowcastPolygon: sim.nowcastPolygon,
-    forecastPolygons: sim.forecastPolygons,
-    firebreak,
-    nearestVillage,
-  };
-  geometryCache.set(source, { weather, geometry });
-  return geometry;
-}
 
 function buildIncident(
   source: HotspotSource,
   weather: WeatherTelemetry,
+  village: Settlement | null,
   status: FireStatus,
   verifiedBy?: string,
   verifiedAt?: string,
 ): HotspotIncident {
+  let cached = geometryCache.get(source);
+  if (!cached || cached.weather !== weather || cached.village !== village) {
+    const now = new Date();
+    const input = {
+      originLat: source.originLat,
+      originLng: source.originLng,
+      satelliteAcquisitionTime: source.satelliteAcquisitionTime,
+      weather,
+      peatlandInfo: source.peatlandInfo,
+    };
+    const sim = simulateSpread(input, now);
+    cached = {
+      weather,
+      village,
+      geometry: {
+        nowcastPolygon: sim.nowcastPolygon,
+        forecastPolygons: sim.forecastPolygons,
+        firebreak: computeFirebreak(input, now, { model: sim.model }),
+        nearestVillage: village ? computeVillageThreat(input, village, now, sim.model) : null,
+      },
+    };
+    geometryCache.set(source, cached);
+  }
   return {
     ...source,
     status,
     weather,
-    ...incidentGeometry(source, weather),
+    ...cached.geometry,
     lastVerifiedBy: verifiedBy,
     lastVerifiedAt: verifiedAt,
   };
 }
 
+/** Statistics over every fire in the current view, simulated or not. */
+export interface ViewStats {
+  fires: number;
+  indonesia: number;
+  insideKhg: number;
+  fresh: number;
+  totalFrp: number;
+  detections: number;
+  byStatus: Record<FireStatus, number>;
+  bySatellite: Record<string, number>;
+}
+
+/** Residents per incident zone from WorldPop (null = lookup failed). */
+export interface ZonePopulation {
+  danger: number | null;
+  smoke: number | null;
+}
+
+export interface FirmsState {
+  status: "loading" | "ok" | "error";
+  /** True when MAP_KEY is set, so Indonesia gets three days of history. */
+  keyed: boolean;
+  detections: number;
+  sources: FirmsSourceStatus[];
+  fetchedAt: string | null;
+  reason: string | null;
+}
+
 export interface UseIncidentsResult {
+  /** Simulated incidents: the most urgent fires in view, Indonesia first. */
   incidents: HotspotIncident[];
+  /** Fire events worldwide that pass the filter, for the map layer. */
+  hotspots: MapHotspot[];
+  /** Air quality per 0.5-degree area around simulated fires (key = cellKey). */
+  air: Record<string, AirQuality>;
+  filter: HotspotFilter;
+  setFilter: (f: HotspotFilter) => void;
+  viewStats: ViewStats;
+  /** WorldPop residents per incident id (top POPULATION_LIMIT incidents). */
+  population: Record<string, ZonePopulation>;
+  /** Kabupaten/province per 0.5-degree area (key = cellKey). */
+  regions: Record<string, Region | null>;
+  /** Karhutla news per kabupaten name. */
+  areaNews: Record<string, NewsArticle[]>;
+  /** Counts per status: worldwide and inside Indonesia. */
+  statusCounts: { world: Record<FireStatus, number>; indonesia: Record<FireStatus, number> };
+  /** Fires in view still waiting for their area's weather before simulation. */
+  pendingWeather: number;
+  /** Fires in view beyond ACTIVE_LIMIT that are on the map but not simulated. */
+  overflow: number;
   weather: WeatherTelemetry | null;
   /** Provider that supplied `weather` (attribution is required for both). */
   weatherSource: WeatherSource | null;
+  /** Weather provider per simulated incident id. */
+  incidentWeatherSource: Record<string, { source: "bmkg" | "open-meteo"; place?: string | null }>;
   maritime: MaritimeConditions | null;
   weatherError: string | null;
   weatherLoading: boolean;
   selectedId: string | null;
+  /** Selection made by a person (list, map, other window), not the default pick. */
+  focusId: string | null;
   selectIncident: (id: string) => void;
   selectedIncident: HotspotIncident | null;
   refreshWeather: () => void;
+  setViewport: (bbox: Bbox) => void;
+  firms: FirmsState;
   satelliteNotice: string | null;
-  /** NASA FIRMS live fire detections (empty when key missing or no fires). */
-  firePoints: FirePoint[];
-  /** True when MAP_KEY is set and FIRMS replied with detections. */
-  firmsLive: boolean;
-  /** True until the first FIRMS response lands (distinguishes loading from empty). */
-  firmsLoading: boolean;
 }
 
-export function useIncidents(): UseIncidentsResult {
+function emptyCounts(): Record<FireStatus, number> {
+  return {
+    UNVERIFIED_HOTSPOT: 0,
+    CONFIRMED_FLAMING: 0,
+    SUSPECTED_SMOLDERING: 0,
+    CONFIRMED_SMOLDERING: 0,
+    EXTINGUISHED: 0,
+  };
+}
+
+/** Run `run` for keys not requested yet, in batches; failed keys are released for a retry. */
+async function fetchMissing(
+  keys: string[],
+  requested: Set<string>,
+  batchSize: number,
+  run: (batch: string[]) => Promise<void>,
+) {
+  const missing = [...new Set(keys)].filter((k) => !requested.has(k));
+  for (let i = 0; i < missing.length; i += batchSize) {
+    const batch = missing.slice(i, i + batchSize);
+    batch.forEach((k) => requested.add(k));
+    try {
+      await run(batch);
+    } catch {
+      batch.forEach((k) => requested.delete(k));
+    }
+  }
+}
+
+function nearestWithin(lat: number, lng: number, places: Settlement[], maxKm: number): Settlement | null {
+  let best: Settlement | null = null;
+  let bestKm = maxKm;
+  const cos = Math.cos((lat * Math.PI) / 180);
+  for (const p of places) {
+    const km = Math.hypot(p.lat - lat, (p.lng - lng) * cos) * 111.32;
+    if (km <= bestKm) {
+      bestKm = km;
+      best = p;
+    }
+  }
+  return best;
+}
+
+export function useIncidents(
+  initialViewport: Bbox = [...SETTLEMENT_BBOX],
+  /** Fires kept simulated and preloaded regardless of the view (presentation scenes). */
+  pinnedIds: string[] = [],
+): UseIncidentsResult {
   const [statuses, setStatuses] = useState<StatusMap>({});
   const [weather, setWeather] = useState<WeatherTelemetry | null>(null);
   const [weatherSource, setWeatherSource] = useState<WeatherSource | null>(null);
   const [maritime, setMaritime] = useState<MaritimeConditions | null>(null);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [satelliteNotice, setSatelliteNotice] = useState<string | null>(null);
-  const [firePoints, setFirePoints] = useState<FirePoint[]>([]);
-  const [firmsConfigured, setFirmsConfigured] = useState(false);
-  const [firmsLoading, setFirmsLoading] = useState(true);
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const [rawHotspots, setRawHotspots] = useState<FusedHotspot[]>([]);
+  const [firms, setFirms] = useState<FirmsState>({
+    status: "loading",
+    keyed: false,
+    detections: 0,
+    sources: [],
+    fetchedAt: null,
+    reason: null,
+  });
+  const [viewport, setViewportState] = useState<Bbox>(initialViewport);
+  const [cellWeather, setCellWeather] = useState<Record<string, CellWeather>>({});
+  const [places, setPlaces] = useState<Record<string, Settlement | null>>({});
+  const [air, setAir] = useState<Record<string, AirQuality>>({});
+  const [filter, setFilter] = useState<HotspotFilter>(DEFAULT_FILTER);
+  const requestedAir = useRef(new Set<string>());
+  const [placesByCell, setPlacesByCell] = useState<Record<string, Settlement[]>>({});
+  const requestedPlaceCells = useRef(new Set<string>());
+  const [regions, setRegions] = useState<Record<string, Region | null>>({});
+  const [areaNews, setAreaNews] = useState<Record<string, NewsArticle[]>>({});
+  const requestedRegions = useRef(new Set<string>());
+  const [population, setPopulation] = useState<Record<string, ZonePopulation>>({});
+  const requestedPopulation = useRef(new Set<string>());
+  const [placeWeather, setPlaceWeather] = useState<Record<string, CellWeather>>({});
   const hydrated = useRef(false);
+  const requestedCells = useRef(new Set<string>());
+  const requestedPlaces = useRef(new Set<string>());
 
-  // Mirror state in refs so the FIRMS loader always sees fresh values
-  const firePointsRef = useRef(firePoints);
-  firePointsRef.current = firePoints;
-
-  /* ---------------- weather (Open-Meteo, BMKG fallback) ---------------- */
+  /* ---------------- weather (BMKG, Open-Meteo fallback) ---------------- */
 
   const loadWeather = useCallback(async () => {
     setWeatherLoading(true);
     try {
-      const res = await fetch(`/api/weather?adm4=${DEFAULT_ADM4}`, { cache: "no-store" });
-      const json: unknown = await res.json();
+      const json = await trackedJson<{ ok?: boolean }>("bmkg", `/api/weather?adm4=${DEFAULT_ADM4}`, {
+        isOk: (j) => j.ok === true,
+      });
       const parsed = WeatherApiResponseSchema.safeParse(json);
       if (!parsed.success) {
         const errorMessage =
@@ -174,8 +363,9 @@ export function useIncidents(): UseIncidentsResult {
 
   const loadMaritime = useCallback(async () => {
     try {
-      const res = await fetch("/api/maritime", { cache: "no-store" });
-      const json: unknown = await res.json();
+      const json = await trackedJson<{ ok?: boolean }>("maritime", "/api/maritime", {
+        isOk: (j) => j.ok === true,
+      });
       const parsed = MaritimeApiResponseSchema.safeParse(json);
       if (!parsed.success) return;
       const c = parsed.data.current;
@@ -194,41 +384,42 @@ export function useIncidents(): UseIncidentsResult {
     }
   }, []);
 
-  /* ---------------- NASA FIRMS hotspots ---------------- */
+  /* ---------------- NASA FIRMS (worldwide, every satellite) ---------------- */
 
   const loadFirms = useCallback(async () => {
     try {
-      const res = await fetch("/api/firms", { cache: "no-store" });
-      const json: unknown = await res.json();
+      const json = await trackedJson<{ ok?: boolean; detections?: number }>("firms", "/api/firms", {
+        isOk: (j) => j.ok === true,
+        count: (j) => j.detections ?? null,
+      });
       const parsed = FirmsApiResponseSchema.safeParse(json);
-      if (!parsed.success) return;
-      const failed =
-        parsed.data.configured && parsed.data.fires.length === 0 && Boolean(parsed.data.reason);
-      // A failed refresh keeps the detections (and notice) already on screen
-      if (failed && firePointsRef.current.length > 0) return;
-      setFirmsConfigured(parsed.data.configured);
-      setFirePoints(parsed.data.fires);
-      if (parsed.data.configured && parsed.data.fires.length > 0) {
-        setSatelliteNotice(
-          `${parsed.data.fires.length} titik api terdeteksi NASA FIRMS (VIIRS near-real-time) di area KHG.`,
-        );
-      } else if (parsed.data.configured && parsed.data.reason) {
-        setSatelliteNotice(
-          `${parsed.data.reason} Titik api tidak bisa ditampilkan sampai koneksi satelit normal kembali.`,
-        );
-      } else if (parsed.data.configured) {
-        setSatelliteNotice(
-          `NASA FIRMS tidak mendeteksi hotspot di area KHG dalam 3 hari terakhir.`,
-        );
-      } else {
-        setSatelliteNotice(
-          `MAP_KEY NASA FIRMS belum diset, data titik api satelit tidak tersedia. Daftar gratis di https://firms.modaps.eosdis.nasa.gov/api/`,
-        );
+      if (!parsed.success) throw new Error("Respons FIRMS tidak dikenali");
+      const d = parsed.data;
+      if (!d.ok || !d.hotspots) {
+        // A failed refresh keeps the fires already on screen
+        setFirms((prev) => ({
+          ...prev,
+          status: prev.status === "ok" ? "ok" : "error",
+          keyed: d.keyed,
+          reason: d.reason ?? "Gagal memuat NASA FIRMS",
+        }));
+        return;
       }
-    } catch {
-      // FIRMS is supplementary; keep the detections already on screen
-    } finally {
-      setFirmsLoading(false);
+      setRawHotspots(decodeHotspots(d.hotspots));
+      setFirms({
+        status: "ok",
+        keyed: d.keyed,
+        detections: d.detections,
+        sources: d.sources,
+        fetchedAt: d.fetchedAt ?? null,
+        reason: null,
+      });
+    } catch (err) {
+      setFirms((prev) => ({
+        ...prev,
+        status: prev.status === "ok" ? "ok" : "error",
+        reason: err instanceof Error ? err.message : "Gagal memuat NASA FIRMS",
+      }));
     }
   }, []);
 
@@ -240,11 +431,20 @@ export function useIncidents(): UseIncidentsResult {
       void loadWeather();
       void loadMaritime();
     }, 5 * 60_000);
-    // VIIRS passes arrive a few times a day; the proxy caches for 15 minutes
-    const firmsTimer = window.setInterval(() => void loadFirms(), 15 * 60_000);
+    // The proxy refreshes FIRMS every 10 minutes
+    const firmsTimer = window.setInterval(() => void loadFirms(), 10 * 60_000);
+    // Area forecasts are cached 30 minutes server-side; let them refetch after that
+    const cellTimer = window.setInterval(() => {
+      requestedCells.current.clear();
+      requestedAir.current.clear();
+      requestedPopulation.current.clear();
+      setCellWeather({});
+      setAir({});
+    }, 30 * 60_000);
     return () => {
       window.clearInterval(weatherTimer);
       window.clearInterval(firmsTimer);
+      window.clearInterval(cellTimer);
     };
   }, [loadWeather, loadMaritime, loadFirms]);
 
@@ -278,58 +478,396 @@ export function useIncidents(): UseIncidentsResult {
           [msg.id]: { status, verifiedBy: msg.verifiedBy, verifiedAt: msg.verifiedAt },
         }));
       } else if (msg.type === "incident:select") {
-        setSelectedId(msg.id);
+        setFocusId(msg.id);
       } else if (msg.type === "weather:telemetry") {
         setWeather(msg.telemetry);
       }
     });
   }, []);
 
-  /* ---------------- incidents (engine) ---------------- */
+  /* ---------------- hotspots, status and the active set ---------------- */
 
-  const sources = useMemo(
-    () => firePoints.map(firePointToSource),
-    [firePoints],
+  const allHotspots = useMemo<MapHotspot[]>(() => {
+    const newest = rawHotspots.reduce((m, h) => Math.max(m, Date.parse(h.lastSeen)), 0);
+    return rawHotspots.map((h) => ({
+      ...h,
+      effectiveStatus: effectiveStatus(h, statuses[h.id]),
+      // Relative to the newest pass in the data, so it needs no clock
+      fresh: newest - Date.parse(h.lastSeen) <= FRESH_HOURS * 3600_000,
+    }));
+  }, [rawHotspots, statuses]);
+
+  const hotspots = useMemo(() => {
+    const newest = rawHotspots.reduce((m, h) => Math.max(m, Date.parse(h.lastSeen)), 0);
+    const allowed = new Set(filter.statuses);
+    return allHotspots.filter(
+      (h) =>
+        allowed.has(h.effectiveStatus) &&
+        (filter.region === "all" || h.inIndonesia) &&
+        (filter.maxAgeHours === null ||
+          newest - Date.parse(h.lastSeen) <= filter.maxAgeHours * 3600_000),
+    );
+  }, [allHotspots, rawHotspots, filter]);
+
+  const statusCounts = useMemo(() => {
+    const world = emptyCounts();
+    const indonesia = emptyCounts();
+    for (const h of allHotspots) {
+      world[h.effectiveStatus] += 1;
+      if (h.inIndonesia) indonesia[h.effectiveStatus] += 1;
+    }
+    return { world, indonesia };
+  }, [allHotspots]);
+
+  const pinnedKey = pinnedIds.join("|");
+  const { active, overflow, viewStats } = useMemo(() => {
+    const inView = hotspots.filter((h) => inBbox(h, viewport));
+    inView.sort((a, b) => compareRank(priority(a), priority(b)));
+    const picked = inView.slice(0, ACTIVE_LIMIT);
+    // The focused and pinned fires stay simulated even after panning away from them
+    const keep = new Set([focusId, ...pinnedKey.split("|")].filter(Boolean));
+    for (const h of allHotspots) {
+      if (keep.has(h.id) && !picked.includes(h)) picked.push(h);
+    }
+
+    const stats: ViewStats = {
+      fires: inView.length,
+      indonesia: 0,
+      insideKhg: 0,
+      fresh: 0,
+      totalFrp: 0,
+      detections: 0,
+      byStatus: emptyCounts(),
+      bySatellite: {},
+    };
+    for (const h of inView) {
+      if (h.inIndonesia) stats.indonesia += 1;
+      if (h.insideKhg) stats.insideKhg += 1;
+      if (h.fresh) stats.fresh += 1;
+      stats.totalFrp += h.maxFrpMegawatt;
+      stats.detections += h.detectionCount;
+      stats.byStatus[h.effectiveStatus] += 1;
+      for (const sat of h.satellites) stats.bySatellite[sat] = (stats.bySatellite[sat] ?? 0) + 1;
+    }
+    return { active: picked, overflow: Math.max(0, inView.length - ACTIVE_LIMIT), viewStats: stats };
+  }, [hotspots, allHotspots, viewport, focusId, pinnedKey]);
+
+  // Sources are memoized per hotspot object so the geometry cache survives re-renders
+  const sourceCache = useRef(new WeakMap<FusedHotspot, HotspotSource>());
+  const receivedAt = firms.fetchedAt ?? "";
+  const rawById = useMemo(() => new Map(rawHotspots.map((h) => [h.id, h])), [rawHotspots]);
+  const activeSources = useMemo(
+    () =>
+      active.map((h) => {
+        const raw = rawById.get(h.id) ?? h;
+        let src = sourceCache.current.get(raw);
+        if (!src) {
+          src = hotspotToSource(raw, receivedAt);
+          sourceCache.current.set(raw, src);
+        }
+        return { hotspot: h, source: src };
+      }),
+    [active, rawById, receivedAt],
   );
 
-  const incidents = useMemo(() => {
-    return sources.map((source) => {
-      const entry = statuses[source.id];
-      const effectiveWeather = weather ?? fallbackWeather();
-      return buildIncident(
-        source,
-        effectiveWeather,
-        entry?.status ?? source.status,
-        entry?.verifiedBy,
-        entry?.verifiedAt,
+  /* ---------------- per-area weather for the active set ---------------- */
+
+  useEffect(() => {
+    const missing = [...new Set(active.map((h) => cellKey(h.lat, h.lng)))].filter(
+      (k) => !requestedCells.current.has(k),
+    );
+    if (missing.length === 0) return;
+    const timer = window.setTimeout(async () => {
+      for (let i = 0; i < missing.length; i += MAX_CELLS_PER_REQUEST) {
+        const batch = missing.slice(i, i + MAX_CELLS_PER_REQUEST);
+        batch.forEach((k) => requestedCells.current.add(k));
+        try {
+          const json = await trackedJson<{ ok?: boolean; cells?: unknown[] }>(
+            "grid",
+            `/api/weather/grid?cells=${encodeURIComponent(batch.join(";"))}`,
+            { isOk: (j) => j.ok === true, count: (j) => j.cells?.length ?? null },
+          );
+          const parsed = WeatherGridResponseSchema.safeParse(json);
+          if (!parsed.success) throw new Error("grid");
+          setCellWeather((prev) => {
+            const next = { ...prev };
+            for (const c of parsed.data.cells) {
+              next[c.key] = { source: c.source, place: c.place, telemetry: c.telemetry };
+            }
+            return next;
+          });
+          // Areas the providers did not answer may be retried on the next view change
+          const answered = new Set(parsed.data.cells.map((c) => c.key));
+          batch.filter((k) => !answered.has(k)).forEach((k) => requestedCells.current.delete(k));
+        } catch {
+          batch.forEach((k) => requestedCells.current.delete(k));
+        }
+      }
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [active]);
+
+  /* ---------------- air quality for the active set ---------------- */
+
+  useEffect(() => {
+    const missing = [...new Set(active.map((h) => cellKey(h.lat, h.lng)))].filter(
+      (k) => !requestedAir.current.has(k),
+    );
+    if (missing.length === 0) return;
+    const timer = window.setTimeout(async () => {
+      for (let i = 0; i < missing.length; i += MAX_CELLS_PER_REQUEST) {
+        const batch = missing.slice(i, i + MAX_CELLS_PER_REQUEST);
+        batch.forEach((k) => requestedAir.current.add(k));
+        try {
+          const json = await trackedJson<{ ok?: boolean; cells?: unknown[] }>(
+            "air",
+            `/api/air?cells=${encodeURIComponent(batch.join(";"))}`,
+            { isOk: (j) => j.ok === true, count: (j) => j.cells?.length ?? null },
+          );
+          const parsed = AirGridResponseSchema.safeParse(json);
+          if (!parsed.success) throw new Error("air");
+          setAir((prev) => {
+            const next = { ...prev };
+            for (const c of parsed.data.cells) next[c.key] = c.air;
+            return next;
+          });
+        } catch {
+          batch.forEach((k) => requestedAir.current.delete(k));
+        }
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [active]);
+
+  /* ---------------- villages, kabupaten and area news for the active set ---------------- */
+
+  useEffect(() => {
+    const keys = active.map((h) => cellKey(h.lat, h.lng));
+    const timer = window.setTimeout(() => {
+      void fetchMissing(keys, requestedPlaceCells.current, 40, async (batch) => {
+        const json = await trackedJson<{ ok?: boolean; cells?: { key: string; places: Settlement[] }[] }>(
+          "place",
+          `/api/places?cells=${encodeURIComponent(batch.join(";"))}`,
+          { isOk: (j) => j.ok === true, count: (j) => j.cells?.reduce((n, c) => n + c.places.length, 0) ?? null },
+        );
+        if (!json.ok || !json.cells) throw new Error("places");
+        setPlacesByCell((prev) => ({ ...prev, ...Object.fromEntries(json.cells!.map((c) => [c.key, c.places])) }));
+      });
+      void fetchMissing(keys, requestedRegions.current, 30, async (batch) => {
+        const json = await trackedJson<{
+          ok?: boolean;
+          regions?: Record<string, Region | null>;
+          news?: Record<string, NewsArticle[]>;
+        }>("areas", `/api/areas?cells=${encodeURIComponent(batch.join(";"))}`, {
+          isOk: (j) => j.ok === true,
+          count: (j) => (j.news ? Object.values(j.news).reduce((n, a) => n + a.length, 0) : null),
+        });
+        if (!json.ok || !json.regions) throw new Error("areas");
+        setRegions((prev) => ({ ...prev, ...json.regions }));
+        setAreaNews((prev) => ({ ...prev, ...json.news }));
+      });
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [active]);
+
+  /* ---------------- village + BMKG for the selected fire ---------------- */
+
+  const defaultPick = activeSources[0]?.hotspot.id ?? null;
+  const selectedHotspotId = focusId ?? defaultPick;
+  const selectedHotspot = useMemo(
+    () => allHotspots.find((h) => h.id === selectedHotspotId) ?? null,
+    [allHotspots, selectedHotspotId],
+  );
+
+  useEffect(() => {
+    const h = selectedHotspot;
+    if (!h || h.nearestSettlement || requestedPlaces.current.has(h.id)) return;
+    requestedPlaces.current.add(h.id);
+    void (async () => {
+      try {
+        const json = await trackedJson<{
+          ok?: boolean;
+          nearest?: Settlement | null;
+          coded?: Settlement | null;
+        }>("place", `/api/place?lat=${h.lat}&lng=${h.lng}`, { isOk: (j) => j.ok === true });
+        if (!json.ok) throw new Error("place");
+        setPlaces((prev) => ({ ...prev, [h.id]: json.nearest ?? null }));
+        // An Indonesian village with a Kemendagri code gets its own BMKG forecast
+        if (json.coded?.adm4) {
+          const w = await trackedJson("bmkg", `/api/weather?adm4=${json.coded.adm4}`);
+          const parsed = WeatherApiResponseSchema.safeParse(w);
+          if (parsed.success && parsed.data.source === "bmkg") {
+            const lok = parsed.data.lokasi;
+            setPlaceWeather((prev) => ({
+              ...prev,
+              [h.id]: {
+                source: "bmkg",
+                place: lok ? `${lok.desa}, ${lok.kecamatan}` : json.coded!.name,
+                telemetry: parsed.data.telemetry,
+              },
+            }));
+          }
+        }
+      } catch {
+        // Lookup is best effort; let a later selection retry it
+        requestedPlaces.current.delete(h.id);
+      }
+    })();
+  }, [selectedHotspot]);
+
+  /* ---------------- incidents (engine) ---------------- */
+
+  const { incidents, incidentWeatherSource, pendingWeather } = useMemo(() => {
+    const list: HotspotIncident[] = [];
+    const sources: UseIncidentsResult["incidentWeatherSource"] = {};
+    let pending = 0;
+    for (const { hotspot, source } of activeSources) {
+      const w = placeWeather[hotspot.id] ?? cellWeather[cellKey(hotspot.lat, hotspot.lng)];
+      if (!w) {
+        // No simulation on invented weather: wait for the area forecast
+        pending += 1;
+        continue;
+      }
+      const entry = statuses[hotspot.id];
+      const village =
+        hotspot.nearestSettlement ??
+        places[hotspot.id] ??
+        nearestWithin(hotspot.lat, hotspot.lng, placesByCell[cellKey(hotspot.lat, hotspot.lng)] ?? [], VILLAGE_MAX_KM);
+      list.push(
+        buildIncident(
+          source,
+          w.telemetry,
+          village,
+          hotspot.effectiveStatus,
+          entry && hotspot.effectiveStatus === entry.status ? entry.verifiedBy : undefined,
+          entry && hotspot.effectiveStatus === entry.status ? entry.verifiedAt : undefined,
+        ),
       );
-    });
-  }, [sources, statuses, weather]);
+      sources[hotspot.id] = { source: w.source, place: w.place };
+    }
+    // Most urgent first: Indonesia, status, village threat, fire power
+    list.sort(
+      (a, b) =>
+        Number(b.inIndonesia) - Number(a.inIndonesia) ||
+        FIRE_STATUS_ORDER.indexOf(a.status) - FIRE_STATUS_ORDER.indexOf(b.status) ||
+        THREAT_RANK[a.nearestVillage?.threatLevel ?? "AMAN"] -
+          THREAT_RANK[b.nearestVillage?.threatLevel ?? "AMAN"] ||
+        b.frpMegawatt - a.frpMegawatt,
+    );
+    return { incidents: list, incidentWeatherSource: sources, pendingWeather: pending };
+  }, [activeSources, cellWeather, placeWeather, places, placesByCell, statuses]);
+
+  /* ---------------- WorldPop residents in danger and smoke zones ---------------- */
+
+  useEffect(() => {
+    const top = incidents.filter((i) => i.status !== "EXTINGUISHED").slice(0, POPULATION_LIMIT);
+    const timer = window.setTimeout(() => {
+      void fetchMissing(
+        top.map((i) => i.id),
+        requestedPopulation.current,
+        20,
+        async (ids) => {
+          const now = new Date();
+          const zones = ids.flatMap((id) => {
+            const i = top.find((x) => x.id === id);
+            if (!i) return [];
+            const reachM = stepPolygonFor(i, 12).maxSpreadRadiusM + DANGER_BUFFER_M;
+            const danger = circle([i.originLng, i.originLat], reachM / 1000, { steps: 24, units: "kilometers" });
+            const smoke = smokePlume(i, now, 0);
+            return [
+              { id: `${id}|danger`, ring: danger.geometry.coordinates[0] },
+              { id: `${id}|smoke`, ring: smoke.geometry.coordinates[0] },
+            ];
+          });
+          const started = performance.now();
+          const res = await fetch("/api/population", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ zones }),
+          });
+          const json = (await res.json()) as { ok?: boolean; results?: Record<string, number | null> };
+          reportFeed("population", {
+            ok: json.ok === true,
+            roundTripMs: Math.round(performance.now() - started),
+            upstreamMs: Number(res.headers.get("x-upstream-ms")) || null,
+            items: json.results ? Object.values(json.results).filter((v) => v !== null).length : null,
+            error: json.ok ? null : `HTTP ${res.status}`,
+          });
+          if (!json.ok || !json.results) throw new Error("population");
+          const results = json.results;
+          setPopulation((prev) => {
+            const next = { ...prev };
+            for (const id of ids) {
+              next[id] = { danger: results[`${id}|danger`] ?? null, smoke: results[`${id}|smoke`] ?? null };
+            }
+            return next;
+          });
+        },
+      );
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [incidents]);
 
   const selectedIncident = useMemo(
-    () => incidents.find((i) => i.id === selectedId) ?? incidents[0] ?? null,
-    [incidents, selectedId],
+    () => incidents.find((i) => i.id === selectedHotspotId) ?? incidents[0] ?? null,
+    [incidents, selectedHotspotId],
   );
 
   const selectIncident = useCallback((id: string) => {
-    setSelectedId(id);
+    setFocusId(id);
     publishSync({ type: "incident:select", id });
   }, []);
 
+  const setViewport = useCallback((bbox: Bbox) => {
+    setViewportState((prev) =>
+      prev.every((v, i) => Math.abs(v - bbox[i]) < 1e-4) ? prev : bbox,
+    );
+  }, []);
+
+  const satelliteNotice = useMemo(() => {
+    if (firms.status === "loading") return null;
+    if (firms.status === "error") {
+      return `${firms.reason ?? "NASA FIRMS tidak merespons."} Titik api belum bisa ditampilkan.`;
+    }
+    const indo = Object.values(statusCounts.indonesia).reduce((a, b) => a + b, 0);
+    const world = allHotspots.length;
+    const okSources = firms.sources.filter((s) => s.ok).map((s) => s.label);
+    const history = firms.keyed
+      ? "Riwayat 3 hari untuk Indonesia."
+      : "MAP_KEY belum diset: hanya data 24 jam, deteksi smoldering terbatas.";
+    return `${indo.toLocaleString("id-ID")} kejadian api di Indonesia, ${world.toLocaleString(
+      "id-ID",
+    )} di seluruh dunia, dari ${firms.detections.toLocaleString("id-ID")} piksel ${okSources.join(
+      ", ",
+    )}. ${history}`;
+  }, [firms, allHotspots.length, statusCounts]);
+
   return {
     incidents,
+    hotspots,
+    air,
+    filter,
+    setFilter,
+    viewStats,
+    population,
+    regions,
+    areaNews,
+    statusCounts,
+    pendingWeather,
+    overflow,
     weather,
     weatherSource,
+    incidentWeatherSource,
     maritime,
     weatherError,
     weatherLoading,
     selectedId: selectedIncident?.id ?? null,
+    focusId,
     selectIncident,
     selectedIncident,
     refreshWeather: loadWeather,
+    setViewport,
+    firms,
     satelliteNotice,
-    firePoints,
-    firmsLive: firmsConfigured && sources.length > 0,
-    firmsLoading,
   };
 }

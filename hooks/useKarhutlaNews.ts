@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { NewsArticle } from "@/app/api/news/route";
+import type { NewsArticle } from "@/lib/news";
+import { reportFeed } from "@/lib/apiHealth";
 
 export interface KarhutlaNewsState {
   articles: NewsArticle[];
@@ -27,9 +28,11 @@ export function useKarhutlaNews(): KarhutlaNewsState {
     setLoading(true);
     setError(null);
 
+    const started = performance.now();
+    let res: Response | null = null;
     try {
       const url = isRefresh ? "/api/news?refresh=1" : "/api/news";
-      const res = await fetch(url, {
+      res = await fetch(url, {
         cache: "no-store",
         signal: controller.signal,
       });
@@ -45,12 +48,26 @@ export function useKarhutlaNews(): KarhutlaNewsState {
 
       setArticles(data.articles);
       setUpdatedAt(data.updatedAt || new Date().toISOString());
+      reportFeed("news", {
+        ok: true,
+        roundTripMs: Math.round(performance.now() - started),
+        upstreamMs: Number(res.headers.get("x-upstream-ms")) || null,
+        items: data.articles.length,
+        error: null,
+      });
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         return;
       }
-      setArticles([]);
+      // A failed refresh keeps the articles already shown
       setError(err instanceof Error ? err.message : "Gagal memuat berita terkini");
+      reportFeed("news", {
+        ok: false,
+        roundTripMs: Math.round(performance.now() - started),
+        upstreamMs: Number(res?.headers.get("x-upstream-ms")) || null,
+        items: null,
+        error: err instanceof Error ? err.message : "Gagal memuat berita",
+      });
     } finally {
       setLoading(false);
     }

@@ -25,8 +25,8 @@ import {
   distanceToFireMeters,
   distanceToFirebreakMeters,
 } from "@/lib/simulationEngine";
-import { subscribeSync } from "@/lib/syncChannel";
 import { useIncidents } from "@/hooks/useIncidents";
+import { useNow } from "@/hooks/useNow";
 import GroundTruthButtons from "@/components/hud/GroundTruthButtons";
 import VectorCompass from "@/components/hud/VectorCompass";
 
@@ -65,14 +65,16 @@ export default function HudPage() {
     selectedIncident,
     selectedId,
     selectIncident,
-    firmsLive,
-    firmsLoading,
+    setViewport,
+    firms,
     satelliteNotice,
   } = useIncidents();
+  const firmsLive = firms.status === "ok";
+  const firmsLoading = firms.status === "loading";
   const [online, setOnline] = useState(true);
   const [position, setPosition] = useState<VolunteerPosition>(FALLBACK_POSITION);
-  const [verificationRequest, setVerificationRequest] = useState<string | null>(null);
-  const [updatedAt, setUpdatedAt] = useState<string>("");
+  const now = useNow();
+  const updatedAt = now?.toISOString() ?? "";
 
   /* Volunteer GPS (falls back to Desa Rasau Jaya Umum when denied) */
   useEffect(() => {
@@ -85,22 +87,19 @@ export default function HudPage() {
     );
   }, []);
 
-  // Timestamp set client-side only (new Date() is forbidden during prerender)
-  useEffect(() => {
-    setUpdatedAt(new Date().toISOString());
-  }, []);
 
-  /* Listen for field-verification requests pushed from the dashboard */
+  /* Fires within ~1.5 degrees (about 165 km) of the volunteer get simulated */
   useEffect(() => {
-    return subscribeSync((msg) => {
-      if (msg.type === "incident:status" && msg.status === "SUSPECTED_SMOLDERING") {
-        setVerificationRequest(msg.id);
-        selectIncident(msg.id);
-      }
-    });
-  }, [selectIncident]);
+    setViewport([position.lng - 1.5, position.lat - 1.5, position.lng + 1.5, position.lat + 1.5]);
+  }, [position, setViewport]);
 
-  const onVerify = useCallback(() => setVerificationRequest(null), []);
+  // A fire whose satellite signal vanished needs ground truth: ask for it until answered
+  const [answered, setAnswered] = useState<string | null>(null);
+  const verificationRequest =
+    selectedIncident?.status === "SUSPECTED_SMOLDERING" && answered !== selectedIncident.id
+      ? selectedIncident.id
+      : null;
+  const onVerify = useCallback(() => setAnswered(selectedIncident?.id ?? null), [selectedIncident]);
 
   const incident = selectedIncident;
   const fireBearing =
@@ -145,7 +144,7 @@ export default function HudPage() {
                 : "ml-auto border-amber-500/40 text-amber-300"
             }
           >
-            {firmsLive ? "FIRMS LIVE" : "FIRMS NONAKTIF"}
+            {firmsLive ? "FIRMS LIVE" : firmsLoading ? "MEMUAT FIRMS" : "FIRMS GAGAL"}
           </Badge>
         </div>
         <div className="flex items-center gap-2">
@@ -208,7 +207,9 @@ export default function HudPage() {
               <p className="text-xs text-slate-500">Memuat titik api NASA FIRMS...</p>
             ) : (
               <p className="text-xs text-slate-500">
-                {satelliteNotice ?? "Belum ada titik api terdeteksi di area KHG."}
+                {firms.status === "error"
+                  ? satelliteNotice
+                  : "Belum ada titik api NASA FIRMS dalam radius sekitar 165 km dari posisi Anda."}
               </p>
             )}
           </div>
@@ -321,8 +322,12 @@ export default function HudPage() {
           <p className="mt-2 flex items-start gap-1.5 text-[11px] text-slate-300">
             <NavigationIcon className="mt-0.5 size-3.5 shrink-0 text-sky-400" />
             Insiden {incident.id} · status {FIRE_STATUS_LABEL[incident.status]} · FRP{" "}
-            {incident.frpMegawatt} MW · desa terdekat {incident.nearestVillage.name} (
-            {Math.round(incident.nearestVillage.distanceMeters)} m)
+            {incident.frpMegawatt} MW ·{" "}
+            {incident.nearestVillage
+              ? `permukiman terdekat ${incident.nearestVillage.name} (${Math.round(
+                  incident.nearestVillage.distanceMeters,
+                )} m)`
+              : "permukiman terdekat sedang dicari"}
           </p>
         </motion.section>
       )}
@@ -330,7 +335,8 @@ export default function HudPage() {
       {/* Incident selector (syncs with dashboard) */}
       <section className="flex flex-wrap gap-1.5">
         <AnimatePresence mode="popLayout">
-          {incidents.map((i) => (
+          {/* Nearest-priority fires only; the list is sorted most urgent first */}
+          {incidents.slice(0, 20).map((i) => (
             <motion.button
               key={i.id}
               type="button"
@@ -357,7 +363,7 @@ export default function HudPage() {
       {incident && <GroundTruthButtons incidentId={incident.id} onSent={onVerify} />}
 
       <p className="mt-auto text-center text-[10px] leading-relaxed text-slate-600">
-        Sumber data: BMKG · Data hotspot: {firmsLive ? "NASA FIRMS (live)" : "NASA FIRMS (nonaktif)"}{" "}
+        Sumber data: BMKG, Open-Meteo · Data hotspot: {firmsLive ? "NASA FIRMS (live)" : "NASA FIRMS (belum tersedia)"}{" "}
         · Koordinat desa: Kemendagri 61.12.07{updatedAt ? ` · Update: ${wibTime(updatedAt)}` : ""}
       </p>
     </div>

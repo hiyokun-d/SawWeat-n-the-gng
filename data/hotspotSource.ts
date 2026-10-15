@@ -1,20 +1,13 @@
 /**
  * Hotspot source data: the input the simulation engine runs on.
  *
- * Satellite-only data model: sources are real NASA FIRMS VIIRS detections
- * converted by `firePointToSource`, anchored to the KHG peatland zones and
- * the Rasau Jaya villages with real BMKG coordinates. Every geometry
- * (nowcast, forecast, firebreak, village threat) is computed at runtime by
- * the engine from a source plus the live BMKG weather.
- *
- * `fallbackWeather()` covers the window between a FIRMS detection landing
- * and live BMKG weather arriving.
- *
- * Timestamps come from factories, never module constants, so `new Date()`
- * never runs during prerender.
+ * Every source is a real NASA FIRMS fire event (pixels from all satellites
+ * fused by lib/firms.ts). Every geometry (nowcast, forecast, firebreak,
+ * village threat) is computed at runtime by the engine from a source plus
+ * live BMKG / Open-Meteo weather for its area. There is no seed data.
  */
 
-import type { FirePoint, HotspotIncident, PeatlandZone, WeatherTelemetry } from "../lib/gambut";
+import type { FusedHotspot, HotspotIncident, PeatlandZone } from "../lib/gambut";
 
 /** Everything except the parts computed at runtime by the simulation engine. */
 export type HotspotSource = Omit<
@@ -22,56 +15,47 @@ export type HotspotSource = Omit<
   "nowcastPolygon" | "forecastPolygons" | "firebreak" | "nearestVillage" | "weather"
 >;
 
-export const PEATLAND_ZONES: Record<string, PeatlandZone> = {
-  "KHG-RASU": {
-    khgId: "KHG-RASU",
-    name: "KHG Rasau Jaya",
-    depthCategory: "SEDANG (1-3m)",
-    baseSpreadRateR0: 18,
-  },
-  "KHG-SKA-SAW": {
+export const PEATLAND_ZONES = {
+  KHG: {
     khgId: "KHG-SKA-SAW",
     name: "KHG Sungai Kapuas - Sungai Ambawang",
     depthCategory: "DALAM (>3m)",
     baseSpreadRateR0: 28,
   },
-  "KHG-KAKAP": {
-    khgId: "KHG-KAKAP",
-    name: "KHG Sungai Kakap",
-    depthCategory: "DANGKAL (<1m)",
+  // No peat-depth map is loaded for the rest of the world, so these use the
+  // slowest prd.md rate rather than claiming a depth
+  INDONESIA: {
+    khgId: "ID-UNMAPPED",
+    name: "Indonesia, kedalaman gambut belum terpetakan",
+    depthCategory: "TIDAK TERPETAKAN",
     baseSpreadRateR0: 12,
   },
-};
+  WORLD: {
+    khgId: "WORLD",
+    name: "Di luar Indonesia",
+    depthCategory: "TIDAK TERPETAKAN",
+    baseSpreadRateR0: 12,
+  },
+} satisfies Record<string, PeatlandZone>;
 
-/** Typical Kubu Raya dry-season conditions used until live BMKG data lands. */
-export function fallbackWeather(): WeatherTelemetry {
+export function hotspotToSource(h: FusedHotspot, receivedAt: string): HotspotSource {
   return {
-    windSpeedKmh: 15,
-    windDirectionDeg: 270,
-    windVectorDeg: 90,
-    relativeHumidity: 65,
-    temperatureC: 31,
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-/**
- * Convert a NASA FIRMS detection into a hotspot source so the simulation
- * engine can run on it. High-confidence VIIRS detections are treated as
- * confirmed surface fires; nominal/low detections start unverified until a
- * field team checks them. Detections are anchored to KHG Sungai Kapuas -
- * Sungai Ambawang, the deepest peat zone that spans the query bbox.
- */
-export function firePointToSource(fire: FirePoint, index: number): HotspotSource {
-  return {
-    id: `FIRMS-${String(index + 1).padStart(3, "0")}`,
-    originLat: fire.lat,
-    originLng: fire.lng,
-    satelliteAcquisitionTime: fire.acquiredAt,
-    systemReceivedTime: new Date().toISOString(),
-    frpMegawatt: fire.frpMegawatt,
-    confidence: fire.confidence,
-    status: fire.confidence === "high" ? "CONFIRMED_FLAMING" : "UNVERIFIED_HOTSPOT",
-    peatlandInfo: PEATLAND_ZONES["KHG-SKA-SAW"],
+    id: h.id,
+    originLat: h.lat,
+    originLng: h.lng,
+    satelliteAcquisitionTime: h.lastSeen,
+    systemReceivedTime: receivedAt,
+    frpMegawatt: h.maxFrpMegawatt,
+    confidence: h.confidence,
+    status: h.status,
+    peatlandInfo: h.insideKhg
+      ? PEATLAND_ZONES.KHG
+      : h.inIndonesia
+        ? PEATLAND_ZONES.INDONESIA
+        : PEATLAND_ZONES.WORLD,
+    satellites: h.satellites,
+    detectionCount: h.detectionCount,
+    firstDetectedAt: h.firstSeen,
+    inIndonesia: h.inIndonesia,
   };
 }

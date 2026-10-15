@@ -2,12 +2,22 @@
 
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { useEffect, useRef } from "react";
-import { BmkgVillages, FIRE_STATUS_COLOR, windVectorDeg } from "@/lib/gambut";
-import { firebreakLineString, stepPolygonFor, windArrowGeometry } from "@/lib/simulationEngine";
+import { useEffect, useRef, useState } from "react";
+import { BmkgVillages, FIRE_STATUS_COLOR, isSmoldering, THREAT_COLOR } from "@/lib/gambut";
+import {
+  evacuationArrow,
+  firebreakLineString,
+  smokePlume,
+  stepPolygonFor,
+  weatherAtHour,
+  windArrowGeometry,
+} from "@/lib/simulationEngine";
 import { OSM_TILES } from "@/lib/basemaps";
 import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
-import { KUBU_RAYA_CENTER, KUBU_RAYA_ZOOM, type GambutMapProps } from "./types";
+import { INDONESIA_CENTER, INDONESIA_ZOOM, type GambutMapProps } from "./types";
+
+/** SVG/canvas markers get slow past a few thousand; the rest of the world appears on zoom-in. */
+const MAX_HOTSPOT_MARKERS = 6000;
 
 // Same sky blue as the MapLibre wind arrow
 const WIND_COLOR = "#0284c7";
@@ -22,8 +32,8 @@ export default function LeafletMap(props: GambutMapProps) {
   const khgLayer = useRef<L.GeoJSON | null>(null);
   const incidentLayers = useRef<L.LayerGroup | null>(null);
   const villageLayer = useRef<L.LayerGroup | null>(null);
-  // Re-centering on every slider tick makes the map jump; only follow selection changes
-  const centeredOn = useRef<string | null>(null);
+  const hotspotLayer = useRef<L.LayerGroup | null>(null);
+  const [viewTick, setViewTick] = useState(0);
 
   // Latest props without re-creating the map
   const cb = useRef(props);
@@ -35,7 +45,7 @@ export default function LeafletMap(props: GambutMapProps) {
     const map = L.map(containerRef.current!, {
       preferCanvas: false,
       zoomControl: false,
-    }).setView([KUBU_RAYA_CENTER[1], KUBU_RAYA_CENTER[0]], KUBU_RAYA_ZOOM);
+    }).setView([INDONESIA_CENTER[1], INDONESIA_CENTER[0]], Math.round(INDONESIA_ZOOM));
     L.control.zoom({ position: "bottomright" }).addTo(map);
     L.tileLayer(OSM_TILES.url, {
       maxZoom: OSM_TILES.maxZoom,
@@ -74,8 +84,17 @@ export default function LeafletMap(props: GambutMapProps) {
       pin.addTo(villageLayer.current);
     }
 
+    hotspotLayer.current = L.layerGroup().addTo(map);
     incidentLayers.current = L.layerGroup().addTo(map);
     mapRef.current = map;
+
+    const reportViewport = () => {
+      const b = map.getBounds();
+      cb.current.onViewportChange([b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]);
+      setViewTick((t) => t + 1);
+    };
+    map.on("moveend", reportViewport);
+    reportViewport();
 
     return () => {
       map.remove();
@@ -83,8 +102,54 @@ export default function LeafletMap(props: GambutMapProps) {
       khgLayer.current = null;
       incidentLayers.current = null;
       villageLayer.current = null;
+      hotspotLayer.current = null;
     };
   }, []);
+
+  // Worldwide fires in view on one shared canvas; Indonesia larger and opaque
+  useEffect(() => {
+    const layer = hotspotLayer.current;
+    const map = mapRef.current;
+    if (!layer || !map) return;
+    layer.clearLayers();
+    const bounds = map.getBounds();
+    const renderer = L.canvas({ padding: 0.2 });
+    const inView = props.hotspots.filter((h) => bounds.contains([h.lat, h.lng]));
+    // Indonesia first so the cap never hides it
+    inView.sort((a, b) => Number(b.inIndonesia) - Number(a.inIndonesia));
+    for (const h of inView.slice(0, MAX_HOTSPOT_MARKERS)) {
+      const color = FIRE_STATUS_COLOR[h.effectiveStatus];
+      L.circleMarker([h.lat, h.lng], {
+        renderer,
+        radius: h.inIndonesia ? 4 : 2,
+        color: "#0f172a",
+        weight: h.inIndonesia ? 0.75 : 0,
+        fillColor: color,
+        fillOpacity: h.inIndonesia ? 0.95 : 0.55,
+      })
+        .on("click", () => cb.current.onSelectIncident(h.id))
+        .addTo(layer);
+    }
+  }, [props.hotspots, viewTick]);
+
+  // Follow a fire someone picked, not the timeline or the default pick
+  useEffect(() => {
+    const map = mapRef.current;
+    const target = props.focusId ? cb.current.hotspots.find((h) => h.id === props.focusId) : null;
+    if (!map || !target) return;
+    map.setView([target.lat, target.lng], Math.max(map.getZoom(), 12), { animate: true });
+  }, [props.focusId]);
+
+  // Scripted shots from presentation mode
+  useEffect(() => {
+    const map = mapRef.current;
+    const c = props.camera;
+    if (!map || !c) return;
+    map.flyTo([c.center[1], c.center[0]], Math.round(c.zoom), {
+      animate: c.duration > 0,
+      duration: c.duration / 1000,
+    });
+  }, [props.camera]);
 
   useEffect(() => {
     const layer = incidentLayers.current;
@@ -152,7 +217,7 @@ export default function LeafletMap(props: GambutMapProps) {
       const arrow = windArrowGeometry(
         incident.originLat,
         incident.originLng,
-        windVectorDeg(incident.weather.windDirectionDeg),
+        weatherAtHour(incident.weather, new Date(), hourOffset).windVectorDeg,
         stepPolygonFor(incident, hourOffset).maxSpreadRadiusM,
       );
       L.geoJSON(arrow as GeoJSON.GeoJsonObject, {
@@ -167,6 +232,32 @@ export default function LeafletMap(props: GambutMapProps) {
             ? { color: WIND_COLOR, weight: isSelected ? 4 : 2, lineCap: "round" }
             : { color: "#ffffff", weight: 1, fillColor: WIND_COLOR, fillOpacity: 1 },
       }).addTo(layer);
+    }
+
+    // Smoke drift cones and evacuation arrows (same models as the 3D map)
+    const now = new Date();
+    for (const incident of live) {
+      L.geoJSON(smokePlume(incident, now, hourOffset) as GeoJSON.GeoJsonObject, {
+        interactive: false,
+        style: { color: "#94a3b8", weight: 0.5, fillColor: "#64748b", fillOpacity: 0.22 },
+      }).addTo(layer);
+      const v = incident.nearestVillage;
+      if (v && (v.threatLevel !== "AMAN" || incident.id === selected?.id)) {
+        L.circleMarker([v.lat, v.lng], {
+          radius: 10,
+          color: THREAT_COLOR[v.threatLevel],
+          weight: 3,
+          fill: false,
+          interactive: false,
+        }).addTo(layer);
+        L.geoJSON(evacuationArrow(v) as GeoJSON.GeoJsonObject, {
+          interactive: false,
+          style: (f) =>
+            f?.properties?.part === "shaft"
+              ? { color: "#10b981", weight: 3, dashArray: "6 4" }
+              : { color: "#022c22", weight: 1, fillColor: "#10b981", fillOpacity: 1 },
+        }).addTo(layer);
+      }
     }
 
     // Markers last so every point stays clickable above the polygons
@@ -186,18 +277,7 @@ export default function LeafletMap(props: GambutMapProps) {
         .addTo(layer);
     }
 
-    // Follow the selection, not the timeline
-    if (selected && centeredOn.current !== selected.id) {
-      centeredOn.current = selected.id;
-      map.setView([selected.originLat, selected.originLng], Math.max(map.getZoom(), 12), {
-        animate: true,
-      });
-    }
   }, [props.incidents, props.selectedId, props.hourOffset]);
 
   return <div ref={containerRef} className="h-full w-full bg-slate-950" />;
-}
-
-function isSmoldering(status: string): boolean {
-  return status === "SUSPECTED_SMOLDERING" || status === "CONFIRMED_SMOLDERING";
 }
