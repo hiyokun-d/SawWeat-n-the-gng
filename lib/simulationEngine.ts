@@ -23,7 +23,6 @@
 import {
   area,
   bearing,
-  booleanPointInPolygon,
   destination,
   distance,
   lineString,
@@ -31,7 +30,6 @@ import {
   point,
   pointToLineDistance,
   polygon,
-  union,
 } from "@turf/turf";
 import type { Feature, FeatureCollection, LineString, Polygon, Position } from "geojson";
 import {
@@ -230,9 +228,6 @@ export function simulateSpread(input: SimulationInput, now: Date = new Date()) {
  * Firebreak line cutting the head-fire path at the crew prep horizon
  * (t+3h) plus a 120 m safety buffer, as five arc points at
  * [wind-35, wind-17.5, wind, wind+17.5, wind+35].
- *
- * options.bufferM widens the safety buffer (used after a satellite-update
- * re-anchoring pushes the line farther ahead).
  */
 export function computeFirebreak(
   input: SimulationInput,
@@ -370,35 +365,6 @@ export function computeNearestVillage(
     threatLevel: threatFromEta(etaMinutes),
     safeEvacuationBearingDeg,
   };
-}
-
-/* ------------------------------------------------------------------ */
-/* Satellite update scenarios                                          */
-/* ------------------------------------------------------------------ */
-
-/** Merge two burn polygons into one (used when a new hotspot lands outside the current polygon). */
-export function mergeBurnPolygons(
-  a: Feature<Polygon>,
-  b: Feature<Polygon>,
-): Feature<Polygon> {
-  const merged = union(
-    { type: "FeatureCollection", features: [a, b] },
-  ) as Feature<Polygon> | { type: "FeatureCollection"; features: Feature<Polygon>[] };
-  if (merged.type === "FeatureCollection") {
-    const first = merged.features[0];
-    if (!first) return a;
-    return first;
-  }
-  return merged;
-}
-
-/** True when a point lies outside a polygon (satellite blind-spot check). */
-export function pointOutsidePolygon(
-  lat: number,
-  lng: number,
-  poly: Feature<Polygon>,
-): boolean {
-  return !booleanPointInPolygon(point([lng, lat]), poly);
 }
 
 /** Distance in meters from a volunteer position to the firebreak line. */

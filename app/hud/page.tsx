@@ -4,8 +4,10 @@ import dynamic from "next/dynamic";
 import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useState } from "react";
 import {
+  ClockIcon,
   MapPinIcon,
   NavigationIcon,
+  SatelliteIcon,
   ScissorsIcon,
   ShieldIcon,
   WifiIcon,
@@ -16,15 +18,12 @@ import {
   BmkgVillages,
   compassName,
   FIRE_STATUS_LABEL,
-  FIRMS_ATTRIBUTION,
-  SECTOR_NAME,
   wibTime,
 } from "@/lib/gambut";
 import {
   bearingToFire,
   distanceToFireMeters,
   distanceToFirebreakMeters,
-  spreadRateToward,
 } from "@/lib/simulationEngine";
 import { subscribeSync } from "@/lib/syncChannel";
 import { useIncidents } from "@/hooks/useIncidents";
@@ -60,8 +59,16 @@ function nearestVillageName(lat: number, lng: number): string {
 }
 
 export default function HudPage() {
-  const { incidents, weather, selectedIncident, selectedId, selectIncident, firmsLive } =
-    useIncidents();
+  const {
+    incidents,
+    weather,
+    selectedIncident,
+    selectedId,
+    selectIncident,
+    firmsLive,
+    firmsLoading,
+    satelliteNotice,
+  } = useIncidents();
   const [online, setOnline] = useState(true);
   const [position, setPosition] = useState<VolunteerPosition>(FALLBACK_POSITION);
   const [verificationRequest, setVerificationRequest] = useState<string | null>(null);
@@ -138,7 +145,7 @@ export default function HudPage() {
                 : "ml-auto border-amber-500/40 text-amber-300"
             }
           >
-            {firmsLive ? "FIRMS LIVE" : "SIMULASI"}
+            {firmsLive ? "FIRMS LIVE" : "FIRMS NONAKTIF"}
           </Badge>
         </div>
         <div className="flex items-center gap-2">
@@ -195,8 +202,15 @@ export default function HudPage() {
             onSelectIncident={selectIncident}
           />
         ) : (
-          <div className="flex h-56 items-center justify-center rounded-xl border border-white/10 text-xs text-slate-500 sm:h-64">
-            Memuat insiden...
+          <div className="flex h-56 flex-col items-center justify-center gap-2 rounded-xl border border-white/10 px-6 text-center sm:h-64">
+            <SatelliteIcon className="size-5 text-slate-600" />
+            {firmsLoading ? (
+              <p className="text-xs text-slate-500">Memuat titik api NASA FIRMS...</p>
+            ) : (
+              <p className="text-xs text-slate-500">
+                {satelliteNotice ?? "Belum ada titik api terdeteksi di area KHG."}
+              </p>
+            )}
           </div>
         )}
       </motion.div>
@@ -210,18 +224,26 @@ export default function HudPage() {
           transition={{ duration: 0.25, ease: "easeOut" }}
           className="grid grid-cols-3 gap-2"
         >
-          <Stat label="Jarak ke api" value={`${Math.round(fireDistance)}`} unit="m" accent="red" />
+          <Stat
+            label="Jarak ke api"
+            value={`${Math.round(fireDistance)}`}
+            secondary="m"
+            accent="red"
+            icon={<MapPinIcon className="size-3.5" />}
+          />
           <Stat
             label="Arah api"
-            value={compassName(fireBearing)}
-            unit={`${Math.round(fireBearing)}°`}
+            value={`${Math.round(fireBearing)}°`}
+            secondary={compassName(fireBearing)}
             accent="orange"
+            icon={<NavigationIcon className="size-3.5" />}
           />
           <Stat
             label="Sisa waktu"
             value={`${incident.firebreak.etaFireArrivalMinutes}`}
-            unit="menit"
+            secondary="menit"
             accent="yellow"
+            icon={<ClockIcon className="size-3.5" />}
           />
         </motion.div>
       )}
@@ -335,23 +357,31 @@ export default function HudPage() {
       {incident && <GroundTruthButtons incidentId={incident.id} onSent={onVerify} />}
 
       <p className="mt-auto text-center text-[10px] leading-relaxed text-slate-600">
-        Sumber data: BMKG · Data hotspot: {firmsLive ? "NASA FIRMS (live)" : "simulasi"} ·
-        Koordinat desa: Kemendagri 61.12.07{updatedAt ? ` · Update: ${wibTime(updatedAt)}` : ""}
+        Sumber data: BMKG · Data hotspot: {firmsLive ? "NASA FIRMS (live)" : "NASA FIRMS (nonaktif)"}{" "}
+        · Koordinat desa: Kemendagri 61.12.07{updatedAt ? ` · Update: ${wibTime(updatedAt)}` : ""}
       </p>
     </div>
   );
 }
 
+/**
+ * Field readout card. Label row carries a small icon for at-a-glance
+ * scanning; the value is the big number the volunteer reads first and the
+ * secondary line carries the unit or the compass name, so value and unit
+ * never split across lines.
+ */
 function Stat({
   label,
   value,
-  unit,
+  secondary,
   accent,
+  icon,
 }: {
   label: string;
   value: string;
-  unit: string;
+  secondary: string;
   accent: "red" | "orange" | "yellow";
+  icon: React.ReactNode;
 }) {
   const color =
     accent === "red"
@@ -360,10 +390,13 @@ function Stat({
         ? "border-orange-500/30 bg-orange-500/10 text-orange-300"
         : "border-yellow-400/30 bg-yellow-400/10 text-yellow-300";
   return (
-    <div className={`rounded-lg border p-2 text-center ${color}`}>
-      <div className="text-[10px] opacity-80">{label}</div>
-      <div className="text-lg leading-tight font-bold tabular-nums">{value}</div>
-      <div className="text-[9px] opacity-70">{unit}</div>
+    <div className={`rounded-xl border p-2.5 text-center ${color}`}>
+      <div className="flex items-center justify-center gap-1.5 text-[10px] font-semibold tracking-wide uppercase opacity-80">
+        {icon}
+        {label}
+      </div>
+      <div className="mt-1 text-2xl leading-none font-extrabold tabular-nums">{value}</div>
+      <div className="mt-0.5 text-[10px] opacity-70">{secondary}</div>
     </div>
   );
 }
