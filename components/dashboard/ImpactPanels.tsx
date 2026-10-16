@@ -14,6 +14,7 @@ import {
   type FireStatus,
   type HotspotIncident,
   type ThreatLevel,
+  aqiTextColor,
 } from "@/lib/gambut";
 import { stepPolygonFor } from "@/lib/simulationEngine";
 import { cellKey, type HotspotFilter, type ViewStats, type ZonePopulation } from "@/hooks/useIncidents";
@@ -377,7 +378,7 @@ export function AirCard({ air }: { air: AirQuality | undefined }) {
   return (
     <div className="space-y-2 rounded-lg border p-3" style={{ borderColor: `${band.color}66` }}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold" style={{ color: band.color }}>
+        <span className="text-xs font-semibold" style={{ color: aqiTextColor(air.usAqi) }}>
           AQI {Math.round(air.usAqi)} · {band.label}
         </span>
         <span className="text-[10px] text-muted-foreground">Open-Meteo / CAMS</span>

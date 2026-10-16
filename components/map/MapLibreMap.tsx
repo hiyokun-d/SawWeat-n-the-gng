@@ -13,6 +13,8 @@ import {
   GlobeIcon,
   MountainSnowIcon,
   RotateCwIcon,
+  SatelliteIcon,
+  SirenIcon,
   WindIcon,
 } from "lucide-react";
 import { motion } from "motion/react";
@@ -30,6 +32,11 @@ import {
   windArrowGeometry,
 } from "@/lib/simulationEngine";
 import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
+import { loadOrbits } from "@/lib/orbits";
+import { prefetchIndonesiaTiles } from "@/lib/tilePrefetch";
+import { CrisisMarkers } from "./crisisMarkers";
+import { MotionOverlay, type MotionLine, type MotionScene } from "./MotionOverlay";
+import Starfield from "./Starfield";
 import { INDONESIA_CENTER, INDONESIA_ZOOM, type GambutMapProps } from "./types";
 
 // MapLibre derives its worker URL from import.meta.url, which is not an http URL once
@@ -64,9 +71,6 @@ const BURN_COLOR = STATUS_COLOR;
 
 // Indonesia is the focus: its fires stay readable from the whole-country view,
 // fires elsewhere are still drawn but small and dimmer
-// Radius without the zoom curve, for paint updates that add to it (zoom must stay top-level)
-const HOTSPOT_RADIUS_FLAT: maplibregl.ExpressionSpecification = ["case", ["get", "indo"], 4, 1.6];
-
 const HOTSPOT_RADIUS: maplibregl.ExpressionSpecification = [
   "interpolate",
   ["linear"],
@@ -118,12 +122,22 @@ const HOME_CAMERA = {
   bearing: 0,
 };
 
-const PULSE_MS = 2800;
+/** Nested plume bands, near to far: share of the full reach and base opacity. */
+// Kept faint: the overlay's drifting puffs carry the motion, and bright cones washed out text in close shots
+const SMOKE_BANDS = [
+  { scale: 0.35, opacity: 0.18 },
+  { scale: 0.65, opacity: 0.11 },
+  { scale: 1, opacity: 0.06 },
+];
+/** PM2.5 (microgram/m3) at which the haze field is fully opaque: "very unhealthy" on the US AQI scale. */
+const HAZE_FULL_PM25 = 150;
+/** Below this zoom the camera sees space: stars and satellite tracks show. */
+const SPACE_ZOOM = 5.5;
+const CRISIS_MIN_ZOOM = 3.4;
 const GROW_MS = 1400;
-const BLINK_MS = 2800;
 
 export default function MapLibreMap(props: MapLibreMapProps) {
-  const { incidents, hotspots, air, selectedId, focusId, camera, chromeless, hourOffset, mapStyle } = props;
+  const { incidents, hotspots, air, selectedId, focusId, camera, chromeless, hourOffset, mapStyle, crises, showCrises, showSatellites } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const appliedStyle = useRef(mapStyle);
@@ -140,6 +154,14 @@ export default function MapLibreMap(props: MapLibreMapProps) {
   const [smoke, setSmoke] = useState(true);
   const [airLayer, setAirLayer] = useState(true);
   const [evac, setEvac] = useState(true);
+  const [sats, setSats] = useState(true);
+  const [crisisLayer, setCrisisLayer] = useState(true);
+  const [farOut, setFarOut] = useState(true);
+  const crisisMarkers = useRef<CrisisMarkers | null>(null);
+  const motionLayer = useRef<MotionOverlay | null>(null);
+  // The overlay scene is assembled from two effects (fires/lines and fresh detections)
+  const motionScene = useRef<MotionScene>({ fires: [], fresh: [], lines: [] });
+  const grown = useRef(false);
   const env = useRef({ globe, terrain, buildings, columns, smoke, airLayer, evac });
   const cb = useRef(props);
   useEffect(() => {
@@ -159,6 +181,9 @@ export default function MapLibreMap(props: MapLibreMapProps) {
         maxPitch: 85,
         // Full Retina density roughly doubles fragment work for little visible gain on a data map
         pixelRatio: Math.min(window.devicePixelRatio || 1, 1.5),
+        // Bounded tile memory: the globe at low zoom otherwise keeps hundreds of tiles alive
+        maxTileCacheSize: 160,
+        refreshExpiredTiles: false,
         attributionControl: { compact: true, customAttribution: BMKG_ATTRIBUTION },
       });
     } catch (err) {
@@ -167,12 +192,18 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     }
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-right");
     mapRef.current = map;
+    // Dev-only handle for the performance scripts (redraw counting); stripped from production builds
+    if (process.env.NODE_ENV !== "production") (window as Window & { __gwMap?: maplibregl.Map }).__gwMap = map;
 
     map.on("webglcontextlost", () => cb.current.onFail("WebGL context lost"));
     map.on("error", (e) => console.warn("[maplibre]", e.error?.message));
+    // The dark style references POI sprites it does not ship; an empty image keeps the console clean
+    map.on("styleimagemissing", (e) => {
+      if (!map.hasImage(e.id)) map.addImage(e.id, { width: 1, height: 1, data: new Uint8Array(4) });
+    });
 
     map.on("style.load", () => {
-      installOverlays(map, env.current);
+      installOverlays(map, env.current, appliedStyle.current === "dark");
       setStyleVersion((v) => v + 1);
     });
 
@@ -181,6 +212,19 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       cb.current.onReady();
       map.flyTo({ ...HOME_CAMERA, duration: 4000, curve: 1.6, essential: true });
     });
+    // Country-level tiles go into the browser cache once the first view has painted
+    map.once("idle", () => prefetchIndonesiaTiles(map));
+
+    // Only a threshold crossing re-renders React, not every zoom frame
+    map.on("zoom", () => {
+      const z = map.getZoom();
+      const far = z < SPACE_ZOOM;
+      setFarOut((prev) => (prev === far ? prev : far));
+      // From globe distance tens of crisis markers would pile into one blob
+      map.getContainer().classList.toggle("gw-globe-far", z < CRISIS_MIN_ZOOM);
+    });
+    crisisMarkers.current = new CrisisMarkers(map);
+    motionLayer.current = new MotionOverlay(map);
 
     // Fire clicks (layer-scoped handlers survive style switches); a click on a
     // simulated incident and on the worldwide layer both select the fire
@@ -190,6 +234,23 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       cb.current.onSelectIncident(id);
       setOrbit(false);
     };
+    // Satellite popup: which sensor, how high, how wide it sees
+    const satPopup = new maplibregl.Popup({ closeButton: false, offset: 10, className: "gw-sat-pop" });
+    map.on("mouseenter", "gw-sat-halo", (e) => {
+      const p = e.features?.[0]?.properties as { name?: string; sensor?: string; alt?: number; swath?: number } | undefined;
+      if (!p?.name) return;
+      map.getCanvas().style.cursor = "pointer";
+      satPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="gw-pop"><p class="gw-pop-kind">${p.name}</p><p class="gw-pop-sub">${p.sensor} · ketinggian ${p.alt} km · lebar sapuan ${p.swath} km</p><p class="gw-pop-sub">Posisi dari elemen orbit CelesTrak (SGP4)</p></div>`,
+        )
+        .addTo(map);
+    });
+    map.on("mouseleave", "gw-sat-halo", () => {
+      map.getCanvas().style.cursor = "";
+      satPopup.remove();
+    });
     for (const layer of ["gw-incidents", "gw-hotspots"]) {
       map.on("click", layer, onFireClick);
       map.on("mouseenter", layer, () => (map.getCanvas().style.cursor = "pointer"));
@@ -209,10 +270,39 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     }
 
     return () => {
+      crisisMarkers.current?.destroy();
+      crisisMarkers.current = null;
+      motionLayer.current?.destroy();
+      motionLayer.current = null;
       map.remove();
       mapRef.current = null;
     };
   }, []);
+
+  // National crises as DOM markers (tens of them, reused across feed refreshes)
+  useEffect(() => {
+    crisisMarkers.current?.update(crises ?? []);
+  }, [crises]);
+  useEffect(() => {
+    crisisMarkers.current?.setVisible(showCrises ?? crisisLayer);
+  }, [crisisLayer, showCrises]);
+
+  // FIRMS satellites: real positions from CelesTrak elements, drawn by the motion overlay from space distance
+  const satsOn = showSatellites ?? sats;
+  useEffect(() => {
+    const overlay = motionLayer.current;
+    if (!ready || !overlay) return;
+    if (!satsOn || !farOut) {
+      overlay.setSatellites(null, false);
+      return;
+    }
+    let cancelled = false;
+    void loadOrbits().then((m) => {
+      if (!cancelled) overlay.setSatellites(m, Boolean(m));
+    });
+    return () => {
+      cancelled = true;
+    };  }, [ready, satsOn, farOut]);
 
   // Fly to a fire someone picked (list, map click, the other window)
   useEffect(() => {
@@ -255,9 +345,16 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       features: hotspots.map((h) => ({
         type: "Feature" as const,
         geometry: { type: "Point" as const, coordinates: [h.lng, h.lat] },
-        properties: { id: h.id, status: h.effectiveStatus, indo: h.inIndonesia, fresh: h.fresh },
+        properties: { id: h.id, status: h.effectiveStatus, indo: h.inIndonesia },
       })),
     });
+    motionScene.current = {
+      ...motionScene.current,
+      fresh: hotspots.flatMap((h) =>
+        h.fresh && h.inIndonesia ? [{ lng: h.lng, lat: h.lat, color: FIRE_STATUS_COLOR[h.effectiveStatus] }] : [],
+      ),
+    };
+    motionLayer.current?.setScene(motionScene.current);
   }, [hotspots, ready, styleVersion]);
 
   // Style switch: everything is re-installed in the style.load handler
@@ -289,8 +386,11 @@ export default function MapLibreMap(props: MapLibreMapProps) {
   }, [smoke, ready, styleVersion]);
 
   useEffect(() => {
-    for (const id of ["gw-air-fill", "gw-air-line"]) if (ready) setVisible(mapRef.current, id, airLayer);
-  }, [airLayer, ready, styleVersion]);
+    if (!ready) return;
+    setVisible(mapRef.current, "gw-haze", airLayer);
+    // Tour frames keep the measured haze sheet but drop the AQI grid squares, which clutter close shots
+    for (const id of ["gw-air-fill", "gw-air-line"]) setVisible(mapRef.current, id, airLayer && !chromeless);
+  }, [airLayer, chromeless, ready, styleVersion]);
 
   useEffect(() => {
     for (const id of ["gw-evac-casing", "gw-evac-shaft", "gw-evac-head", "gw-village-threat"]) {
@@ -303,6 +403,21 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     const map = mapRef.current;
     if (!ready || !map) return;
     const half = AIR_CELL_DEG / 2;
+    // Haze field: one weighted point per area, blended by the heatmap into a continuous smoke sheet
+    map.getSource<GeoJSONSource>("gw-haze")?.setData({
+      type: "FeatureCollection",
+      features: Object.entries(air ?? {}).flatMap(([key, a]) => {
+        if (a.pm25 === null) return [];
+        const [lat, lng] = key.split(",").map(Number);
+        return [
+          {
+            type: "Feature" as const,
+            properties: { w: Math.min(1, a.pm25 / HAZE_FULL_PM25) },
+            geometry: { type: "Point" as const, coordinates: [lng, lat] },
+          },
+        ];
+      }),
+    });
     map.getSource<GeoJSONSource>("gw-air")?.setData({
       type: "FeatureCollection",
       features: Object.entries(air ?? {}).flatMap(([key, a]) => {
@@ -362,10 +477,16 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     map.getSource<GeoJSONSource>("gw-incidents")?.setData(points);
     map.getSource<GeoJSONSource>("gw-incident-columns")?.setData(cols);
 
+    // Grow once, when the first fires arrive; later refreshes must not replay it (each frame is a full redraw)
+    if (grown.current) {
+      map.setPaintProperty("gw-incident-columns", "fill-extrusion-height", ["get", "height"]);
+      return;
+    }
+    grown.current = incidents.length > 0;
     let raf = 0;
     const start = performance.now();
     const tick = (now: number) => {
-      const p = Math.min(1, (now - start) / GROW_MS);
+      const p = Math.min(1, Math.max(0, (now - start) / GROW_MS));
       const eased = 1 - Math.pow(1 - p, 3);
       if (map.getLayer("gw-incident-columns")) {
         map.setPaintProperty("gw-incident-columns", "fill-extrusion-height", [
@@ -441,9 +562,12 @@ export default function MapLibreMap(props: MapLibreMapProps) {
 
     // Smoke drift for every live fire, following the forecast wind at this hour
     const now = new Date();
+    // Far band first so the dense core draws on top
     map.getSource<GeoJSONSource>("gw-smoke")?.setData({
       type: "FeatureCollection",
-      features: live.map((i) => smokePlume(i, now, hourOffset)),
+      features: live.flatMap((i) =>
+        SMOKE_BANDS.map((b, band) => ({ ...smokePlume(i, now, hourOffset, b.scale), properties: { band } })).reverse(),
+      ),
     });
 
     // Threatened villages and their escape direction
@@ -466,71 +590,45 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     map.getSource<GeoJSONSource>("gw-village-threat")?.setData({ type: "FeatureCollection", features: villages });
     map.getSource<GeoJSONSource>("gw-evac")?.setData({ type: "FeatureCollection", features: evacFeatures });
 
-    if (selected && selected.status !== "EXTINGUISHED") {
-      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(firebreakLineString(selected.firebreak));
-    } else {
-      map.getSource<GeoJSONSource>("gw-firebreak")?.setData(emptyFC());
+    const firebreak = selected && selected.status !== "EXTINGUISHED" ? firebreakLineString(selected.firebreak) : null;
+    map.getSource<GeoJSONSource>("gw-firebreak")?.setData(firebreak ?? emptyFC());
+
+    // Moving parts for the overlay: the map keeps the static shapes, the overlay animates on top
+    const shafts = (fc: GeoJSON.FeatureCollection, kind: MotionLine["kind"]): MotionLine[] =>
+      fc.features.flatMap((f) =>
+        f.properties?.part === "shaft" && f.geometry.type === "LineString"
+          ? [{ kind, coords: f.geometry.coordinates as [number, number][] }]
+          : [],
+      );
+    const lines: MotionLine[] = [
+      ...shafts({ type: "FeatureCollection", features: evacFeatures }, "evac"),
+      ...shafts(
+        { type: "FeatureCollection", features: windArrows.features.filter((f) => f.properties?.selected) },
+        "wind",
+      ),
+    ];
+    if (firebreak?.geometry.type === "LineString") {
+      lines.push({ kind: "firebreak", coords: firebreak.geometry.coordinates as [number, number][] });
     }
+    motionScene.current = {
+      ...motionScene.current,
+      lines,
+      fires: live.map((i) => {
+        const plume = smokePlume(i, now, hourOffset);
+        return {
+          lng: i.originLng,
+          lat: i.originLat,
+          color: FIRE_STATUS_COLOR[i.status],
+          active: i.status === "CONFIRMED_FLAMING" || i.status === "UNVERIFIED_HOTSPOT",
+          selected: i.id === selected?.id,
+          frp: i.frpMegawatt,
+          smokeBearing: weatherAtHour(i.weather, now, hourOffset).windVectorDeg,
+          smokeKm: plume.properties.reachKm,
+        };
+      }),
+    };
+    motionLayer.current?.setScene(motionScene.current);
   }, [incidents, selectedId, hourOffset, ready, styleVersion]);
-
-  // Pulse ring on active incidents + blink on smoldering polygons (throttled for GPU efficiency)
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!ready || !map) return;
-
-    const reducedMotion =
-      typeof window !== "undefined" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-    if (reducedMotion) {
-      if (map.getLayer("gw-burn-fill")) {
-        map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.28));
-      }
-      if (map.getLayer("gw-incidents-pulse")) {
-        map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0);
-      }
-      if (map.getLayer("gw-hotspots-pulse")) {
-        // Static ring keeps "new" readable without motion
-        map.setPaintProperty("gw-hotspots-pulse", "circle-radius", ["+", HOTSPOT_RADIUS_FLAT, 4]);
-        map.setPaintProperty("gw-hotspots-pulse", "circle-stroke-opacity", 0.6);
-      }
-      return;
-    }
-
-    // A 10 Hz timer instead of a per-frame loop: the pulses are slow, and each
-    // paint update forces a full repaint, so fewer updates = a cooler GPU
-    let staticOpacity = false;
-    const timer = window.setInterval(() => {
-      if (document.hidden) return;
-      const now = performance.now();
-      const zoom = map.getZoom();
-      // Spread polygons and incident rings are too small to see when zoomed far out
-      const detail = zoom >= 7;
-      if (detail && map.getLayer("gw-incidents-pulse")) {
-        const t = (now % PULSE_MS) / PULSE_MS;
-        map.setPaintProperty("gw-incidents-pulse", "circle-radius", ["+", BASE_RADIUS, t * 12]);
-        map.setPaintProperty("gw-incidents-pulse", "circle-opacity", 0.35 * (1 - t));
-      }
-      // New detections (last 3 h) ripple so fresh fires stand out from old ones
-      if (map.getLayer("gw-hotspots-pulse")) {
-        const t = ((now + PULSE_MS / 2) % PULSE_MS) / PULSE_MS;
-        map.setPaintProperty("gw-hotspots-pulse", "circle-radius", ["+", HOTSPOT_RADIUS_FLAT, t * 10]);
-        map.setPaintProperty("gw-hotspots-pulse", "circle-stroke-opacity", 0.7 * (1 - t));
-      }
-      if (map.getLayer("gw-burn-fill")) {
-        const anySmolder = detail && cb.current.incidents.some((i) => isSmoldering(i.status));
-        if (anySmolder) {
-          const blink = 0.5 + 0.5 * Math.sin((now / BLINK_MS) * Math.PI * 2);
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.22 + blink * 0.16));
-          staticOpacity = false;
-        } else if (!staticOpacity) {
-          map.setPaintProperty("gw-burn-fill", "fill-opacity", burnOpacity(0.3));
-          staticOpacity = true;
-        }
-      }
-    }, 100);
-    return () => window.clearInterval(timer);
-  }, [ready]);
 
   // Slow camera orbit
   useEffect(() => {
@@ -561,12 +659,16 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       { label: "Arah asap", icon: WindIcon, on: smoke, set: setSmoke },
       { label: "Kualitas udara", icon: CloudFogIcon, on: airLayer, set: setAirLayer },
       { label: "Evakuasi", icon: FootprintsIcon, on: evac, set: setEvac },
+      { label: "Krisis nasional", icon: SirenIcon, on: crisisLayer, set: setCrisisLayer },
+      { label: "Satelit FIRMS", icon: SatelliteIcon, on: sats, set: setSats },
     ],
   ];
 
   return (
     <div className="relative h-full w-full">
-      <div ref={containerRef} className="h-full w-full bg-slate-950" />
+      <div className="absolute inset-0 bg-slate-950" />
+      <Starfield visible={globe && farOut} />
+      <div ref={containerRef} className="relative h-full w-full" />
       {ready && !chromeless && (
         <motion.div
           initial={{ opacity: 0, y: -8 }}
@@ -630,17 +732,31 @@ function installOverlays(
     airLayer: boolean;
     evac: boolean;
   },
+  dark: boolean,
 ) {
   map.setProjection({ type: env.globe ? "globe" : "mercator" });
-  map.setSky({
-    "sky-color": "#7dd3fc",
-    "horizon-color": "#e0f2fe",
-    "fog-color": "#f1f5f9",
-    "sky-horizon-blend": 0.5,
-    "horizon-fog-blend": 0.4,
-    "fog-ground-blend": 0.95,
-    "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 0.45, 6, 0.3, 10, 0],
-  });
+  // Dark basemap: night sky with a thin blue limb around the globe; light basemaps keep a day sky
+  map.setSky(
+    dark
+      ? {
+          "sky-color": "#0b1220",
+          "horizon-color": "#1e3a5f",
+          "fog-color": "#0f172a",
+          "sky-horizon-blend": 0.6,
+          "horizon-fog-blend": 0.5,
+          "fog-ground-blend": 0.9,
+          "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 0.85, 5, 0.5, 9, 0],
+        }
+      : {
+          "sky-color": "#7dd3fc",
+          "horizon-color": "#e0f2fe",
+          "fog-color": "#f1f5f9",
+          "sky-horizon-blend": 0.5,
+          "horizon-fog-blend": 0.4,
+          "fog-ground-blend": 0.95,
+          "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 0.45, 6, 0.3, 10, 0],
+        },
+  );
   // Low sun from the south-west so extrusions and relief get readable shading
   map.setLight({ anchor: "map", color: "#fff7ed", intensity: 0.45, position: [1.5, 210, 35] });
 
@@ -666,11 +782,11 @@ function installOverlays(
           ["linear"],
           ["coalesce", ["get", "render_height"], 0],
           0,
-          "#e7e5e4",
+          dark ? "#1e293b" : "#e7e5e4",
           50,
-          "#d6d3d1",
+          dark ? "#334155" : "#d6d3d1",
           150,
-          "#a8a29e",
+          dark ? "#475569" : "#a8a29e",
         ],
         "fill-extrusion-height": [
           "interpolate",
@@ -726,14 +842,48 @@ function installOverlays(
     paint: { "line-color": ["get", "color"], "line-opacity": 0.45, "line-width": 1 },
   });
 
-  // Smoke drift cones (modeled from the forecast wind)
+  // Regional haze from CAMS PM2.5: a soft sheet where the air is actually smoky (measured model, not the cone)
+  map.addSource("gw-haze", { type: "geojson", data: emptyFC() });
+  map.addLayer({
+    id: "gw-haze",
+    type: "heatmap",
+    source: "gw-haze",
+    maxzoom: 10,
+    layout: { visibility: env.airLayer ? "visible" : "none" },
+    paint: {
+      "heatmap-weight": ["get", "w"],
+      // About one 0.5-degree area (55 km) per point at every zoom
+      "heatmap-radius": ["interpolate", ["exponential", 2], ["zoom"], 3, 6, 6, 30, 9, 240],
+      "heatmap-intensity": 0.8,
+      "heatmap-color": [
+        "interpolate",
+        ["linear"],
+        ["heatmap-density"],
+        0,
+        "rgba(0,0,0,0)",
+        0.25,
+        "rgba(148,163,184,0.18)",
+        0.55,
+        "rgba(180,150,120,0.38)",
+        1,
+        "rgba(150,110,70,0.55)",
+      ],
+      "heatmap-opacity": ["interpolate", ["linear"], ["zoom"], 8, 1, 10, 0],
+    },
+  });
+
+  // Smoke drift plumes (modeled from the forecast wind): three nested bands, denser near the fire
   map.addSource("gw-smoke", { type: "geojson", data: emptyFC() });
   map.addLayer({
     id: "gw-smoke",
     type: "fill",
     source: "gw-smoke",
     layout: { visibility: env.smoke ? "visible" : "none" },
-    paint: { "fill-color": "#64748b", "fill-opacity": 0.22, "fill-outline-color": "#94a3b8" },
+    paint: {
+      "fill-color": dark ? "#cbd5e1" : "#64748b",
+      "fill-opacity": ["match", ["get", "band"], 0, SMOKE_BANDS[0].opacity, 1, SMOKE_BANDS[1].opacity, SMOKE_BANDS[2].opacity],
+      "fill-antialias": true,
+    },
   });
 
   // Villages
@@ -875,19 +1025,41 @@ function installOverlays(
   });
 
   // Every fire worldwide (simulated incidents draw on top of these)
-  map.addSource("gw-hotspots", { type: "geojson", data: emptyFC() });
+  // Points only to zoom 12 in the worker index: deeper tiles add memory, not detail
+  map.addSource("gw-hotspots", { type: "geojson", data: emptyFC(), maxzoom: 12, buffer: 32 });
+  // Fire glow: where detections cluster the ground burns brighter, from deep red to white-hot.
+  // It carries the national picture; past zoom 9 the spread polygons take over.
   map.addLayer({
-    id: "gw-hotspots-pulse",
-    type: "circle",
+    id: "gw-heat",
+    type: "heatmap",
     source: "gw-hotspots",
-    // Fresh rings only in the focus country; thousands worldwide would repaint for nothing
-    filter: ["all", ["==", ["get", "fresh"], true], ["==", ["get", "indo"], true]],
+    maxzoom: 11,
+    // Indonesia only: the heatmap pass is the most expensive layer, and the focus country is what needs it
+    filter: ["==", ["get", "indo"], true],
     paint: {
-      "circle-radius": HOTSPOT_RADIUS_FLAT,
-      "circle-color": "rgba(0,0,0,0)",
-      "circle-stroke-color": STATUS_COLOR,
-      "circle-stroke-width": 1.5,
-      "circle-stroke-opacity": 0,
+      "heatmap-weight": [
+        "*",
+        ["case", ["get", "indo"], 1, 0.35],
+        ["match", ["get", "status"], "CONFIRMED_FLAMING", 1, "UNVERIFIED_HOTSPOT", 0.8, "EXTINGUISHED", 0, 0.6],
+      ],
+      "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 1.5, 7, 5, 12, 8, 22, 10, 34],
+      "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 2, 0.7, 9, 1.6],
+      "heatmap-color": [
+        "interpolate",
+        ["linear"],
+        ["heatmap-density"],
+        0,
+        "rgba(0,0,0,0)",
+        0.12,
+        "rgba(127,29,29,0.35)",
+        0.35,
+        "rgba(220,38,38,0.6)",
+        0.65,
+        "rgba(249,115,22,0.82)",
+        1,
+        "rgba(254,240,138,0.95)",
+      ],
+      "heatmap-opacity": ["interpolate", ["linear"], ["zoom"], 8, 0.9, 11, 0],
     },
   });
   map.addLayer({
@@ -917,20 +1089,6 @@ function installOverlays(
       "fill-extrusion-color": STATUS_COLOR,
       "fill-extrusion-height": 0,
       "fill-extrusion-opacity": 0.7,
-    },
-  });
-
-  // Expanding ring behind active incidents (radius/opacity animated in a rAF loop)
-  map.addLayer({
-    id: "gw-incidents-pulse",
-    type: "circle",
-    source: "gw-incidents",
-    filter: ["==", ["get", "active"], true],
-    paint: {
-      "circle-color": "#ef4444",
-      "circle-radius": BASE_RADIUS,
-      "circle-opacity": 0,
-      "circle-blur": 0.4,
     },
   });
 

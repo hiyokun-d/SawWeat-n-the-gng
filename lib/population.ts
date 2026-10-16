@@ -7,7 +7,8 @@
 const WORLDPOP_URL = "https://api.worldpop.org/v1/services/stats";
 const TASKS_URL = "https://api.worldpop.org/v1/tasks";
 export const WORLDPOP_YEAR = 2020;
-const TIMEOUT_MS = 45_000;
+// WorldPop either answers in seconds or hangs for minutes; waiting longer only delays the briefing
+const TIMEOUT_MS = 25_000;
 
 interface WorldPopReply {
   status?: string;

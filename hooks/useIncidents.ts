@@ -9,7 +9,6 @@ import {
   FIRE_STATUS_ORDER,
   FirmsApiResponseSchema,
   MaritimeApiResponseSchema,
-  SETTLEMENT_BBOX,
   toFireStatus,
   WeatherApiResponseSchema,
   WeatherGridResponseSchema,
@@ -84,10 +83,19 @@ interface CellWeather {
   telemetry: WeatherTelemetry;
 }
 
-/** Fires simulated at once: the most urgent ones in view (spread polygons are per-fire work). */
+/**
+ * Fires simulated up front: Indonesia's most urgent, whatever the camera shows,
+ * so zooming and panning across the country never re-simulates or refetches.
+ */
 const ACTIVE_LIMIT = 150;
+/** Extra fires simulated from the current view, for places outside the preloaded set. */
+const VIEW_EXTRA_LIMIT = 40;
+/** Whole Indonesia (west, south, east, north): the default viewport. */
+const INDONESIA_VIEW: Bbox = [94.9, -11.2, 141.1, 6.2];
 /** Fires whose danger and smoke zones get a WorldPop headcount (one request per zone). */
-const POPULATION_LIMIT = 20;
+const POPULATION_LIMIT = 60;
+/** At most this many headcount lookups per 0.5-degree area. */
+const POPULATION_PER_CELL = 3;
 /** A village further than this is not "the village this fire threatens". */
 const VILLAGE_MAX_KM = 30;
 /** Danger zone = the +12 h spread reach plus this buffer, where residents must be ready to move. */
@@ -293,7 +301,7 @@ function nearestWithin(lat: number, lng: number, places: Settlement[], maxKm: nu
 }
 
 export function useIncidents(
-  initialViewport: Bbox = [...SETTLEMENT_BBOX],
+  initialViewport: Bbox = INDONESIA_VIEW,
   /** Fires kept simulated and preloaded regardless of the view (presentation scenes). */
   pinnedIds: string[] = [],
 ): UseIncidentsResult {
@@ -520,14 +528,35 @@ export function useIncidents(
   }, [allHotspots]);
 
   const pinnedKey = pinnedIds.join("|");
+  const preload = useMemo(
+    () =>
+      hotspots
+        .filter((h) => h.inIndonesia)
+        .sort((a, b) => compareRank(priority(a), priority(b)))
+        .slice(0, ACTIVE_LIMIT),
+    [hotspots],
+  );
   const { active, overflow, viewStats } = useMemo(() => {
     const inView = hotspots.filter((h) => inBbox(h, viewport));
     inView.sort((a, b) => compareRank(priority(a), priority(b)));
-    const picked = inView.slice(0, ACTIVE_LIMIT);
+    // `preload` does not depend on the viewport, so its memo survives every camera move
+    const picked = [...preload];
+    const chosen = new Set(picked);
+    let extra = 0;
+    for (const h of inView) {
+      if (extra >= VIEW_EXTRA_LIMIT) break;
+      if (chosen.has(h)) continue;
+      picked.push(h);
+      chosen.add(h);
+      extra += 1;
+    }
     // The focused and pinned fires stay simulated even after panning away from them
     const keep = new Set([focusId, ...pinnedKey.split("|")].filter(Boolean));
     for (const h of allHotspots) {
-      if (keep.has(h.id) && !picked.includes(h)) picked.push(h);
+      if (keep.has(h.id) && !chosen.has(h)) {
+        picked.push(h);
+        chosen.add(h);
+      }
     }
 
     const stats: ViewStats = {
@@ -549,8 +578,9 @@ export function useIncidents(
       stats.byStatus[h.effectiveStatus] += 1;
       for (const sat of h.satellites) stats.bySatellite[sat] = (stats.bySatellite[sat] ?? 0) + 1;
     }
-    return { active: picked, overflow: Math.max(0, inView.length - ACTIVE_LIMIT), viewStats: stats };
-  }, [hotspots, allHotspots, viewport, focusId, pinnedKey]);
+    const simulatedInView = inView.filter((h) => chosen.has(h)).length;
+    return { active: picked, overflow: Math.max(0, inView.length - simulatedInView), viewStats: stats };
+  }, [hotspots, allHotspots, preload, viewport, focusId, pinnedKey]);
 
   // Sources are memoized per hotspot object so the geometry cache survives re-renders
   const sourceCache = useRef(new WeakMap<FusedHotspot, HotspotSource>());
@@ -760,7 +790,23 @@ export function useIncidents(
   /* ---------------- WorldPop residents in danger and smoke zones ---------------- */
 
   useEffect(() => {
-    const top = incidents.filter((i) => i.status !== "EXTINGUISHED").slice(0, POPULATION_LIMIT);
+    // Spread the lookups over areas: a few fires per 0.5-degree area, so every priority
+    // zone gets a headcount instead of the busiest district getting all of them
+    // Round-robin: the first pass gives every area its most urgent fire, later passes add more
+    const byCell = new Map<string, HotspotIncident[]>();
+    for (const i of incidents) {
+      if (i.status === "EXTINGUISHED") continue;
+      const k = cellKey(i.originLat, i.originLng);
+      const list = byCell.get(k) ?? [];
+      if (list.length < POPULATION_PER_CELL) list.push(i);
+      byCell.set(k, list);
+    }
+    const top: HotspotIncident[] = [];
+    for (let pass = 0; pass < POPULATION_PER_CELL && top.length < POPULATION_LIMIT; pass++) {
+      for (const list of byCell.values()) {
+        if (list[pass] && top.length < POPULATION_LIMIT) top.push(list[pass]);
+      }
+    }
     const timer = window.setTimeout(() => {
       void fetchMissing(
         top.map((i) => i.id),

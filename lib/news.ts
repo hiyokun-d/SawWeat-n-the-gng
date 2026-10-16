@@ -82,12 +82,17 @@ export function isIndonesianForestFire(a: NewsArticle): boolean {
 }
 
 
-/** Google News RSS search (Indonesian edition), relevance-filtered, newest first. */
-export async function searchKarhutlaNews(query: string, limit: number): Promise<NewsArticle[]> {
+/** Google News RSS search (Indonesian edition), unfiltered. */
+export async function googleNewsRss(query: string): Promise<NewsArticle[]> {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=id&gl=ID&ceid=ID:id`;
   const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(NEWS_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`Google News RSS HTTP ${res.status}`);
-  return parseRssArticles(await res.text())
+  return parseRssArticles(await res.text());
+}
+
+/** Google News RSS search (Indonesian edition), relevance-filtered, newest first. */
+export async function searchKarhutlaNews(query: string, limit: number): Promise<NewsArticle[]> {
+  return (await googleNewsRss(query))
     .filter(isIndonesianForestFire)
     .sort((x, y) => y.publishedAt.localeCompare(x.publishedAt))
     .slice(0, limit);

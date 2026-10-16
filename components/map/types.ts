@@ -1,6 +1,7 @@
 import type { AirQuality, HotspotIncident } from "@/lib/gambut";
 import type { MapStyleId } from "@/lib/basemaps";
 import type { Bbox, MapHotspot } from "@/hooks/useIncidents";
+import type { CrisisEvent } from "@/lib/crises";
 
 export interface GambutMapProps {
   /** Simulated incidents (spread polygons, firebreak, wind arrows). */
@@ -16,6 +17,11 @@ export interface GambutMapProps {
   camera?: CameraShot | null;
   /** Hide the map's own toolbar (presentation mode). */
   chromeless?: boolean;
+  /** National crises (BMKG, GDACS, news-reported), drawn as markers. */
+  crises?: CrisisEvent[];
+  /** Scripted override of the crisis and satellite layers (presentation scenes). */
+  showCrises?: boolean;
+  showSatellites?: boolean;
   /** Forecast horizon in hours (0 = nowcast). */
   hourOffset: number;
   /** OpenFreeMap style (MapLibre only; Leaflet always uses OSM raster tiles) */

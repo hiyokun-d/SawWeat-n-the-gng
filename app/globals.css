@@ -142,6 +142,103 @@
   }
 }
 
+
+/* ---------- National crisis markers (map) ----------
+   Dark disc + white glyph keeps every non-fire crisis in one cool family, so fire stays
+   the only warm signal on the map; the ring carries severity on the same warm ramp. */
+.gw-crisis {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9999px;
+  border: 2px solid var(--ring);
+  background: rgb(2 6 23 / 0.9);
+  color: #f1f5f9;
+  cursor: pointer;
+  transition: transform 160ms ease-out;
+}
+.gw-crisis svg {
+  width: 15px;
+  height: 15px;
+}
+.gw-globe-far .gw-crisis {
+  visibility: hidden;
+}
+.gw-crisis:hover {
+  transform: scale(1.12);
+}
+.gw-crisis:focus-visible {
+  outline: 2px solid #f8fafc;
+  outline-offset: 3px;
+}
+/* Only severe crises pulse: motion is reserved for what needs attention first */
+.gw-crisis-s3::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  border: 2px solid var(--ring);
+  animation: gw-ring 2.2s ease-out infinite;
+}
+@keyframes gw-ring {
+  from { transform: scale(1); opacity: 0.8; }
+  to { transform: scale(2.1); opacity: 0; }
+}
+
+.maplibregl-popup-content {
+  background: #0b1220;
+  color: #e2e8f0;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.maplibregl-popup-tip {
+  border-top-color: #0b1220 !important;
+  border-bottom-color: #0b1220 !important;
+}
+.maplibregl-popup-close-button {
+  color: #cbd5e1;
+  font-size: 18px;
+  padding: 0 6px;
+}
+.gw-pop { font-size: 12px; line-height: 1.4; }
+.gw-pop-kind { font-weight: 700; font-size: 13px; }
+.gw-pop-sub { color: #94a3b8; font-size: 11px; margin-top: 2px; }
+.gw-pop-title { margin-top: 6px; font-weight: 600; color: #f8fafc; }
+.gw-pop a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.gw-pop-more { margin-top: 6px; display: grid; gap: 4px; color: #cbd5e1; font-size: 11px; }
+.gw-pop-more span { color: #94a3b8; }
+.gw-pop-basis { display: inline-block; margin-top: 8px; font-size: 10px; color: #cbd5e1; border-top: 1px solid rgb(255 255 255 / 0.1); padding-top: 6px; width: 100%; }
+.gw-pop-official { color: #86efac; }
+
+/* ---------- Page transitions (React ViewTransition) ----------
+   The brand mark morphs from the launcher into the dashboard header; everything else crossfades. */
+::view-transition-group(.gw-morph) {
+  animation-duration: 520ms;
+  animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+::view-transition-old(root) {
+  animation: 260ms ease-in both gw-vt-out;
+}
+::view-transition-new(root) {
+  animation: 420ms cubic-bezier(0.2, 0.8, 0.2, 1) 120ms both gw-vt-in;
+}
+@keyframes gw-vt-out {
+  to { opacity: 0; filter: blur(4px); }
+}
+@keyframes gw-vt-in {
+  from { opacity: 0; transform: scale(1.015); filter: blur(4px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gw-crisis-s3::after { animation: none; opacity: 0.6; transform: scale(1.4); }
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) { animation: none !important; }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

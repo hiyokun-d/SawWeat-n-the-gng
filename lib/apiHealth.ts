@@ -8,7 +8,7 @@ import { useSyncExternalStore } from "react";
  * the upstream provider (the `x-upstream-ms` header the routes set).
  */
 
-export type FeedId = "firms" | "bmkg" | "grid" | "air" | "maritime" | "news" | "place" | "areas" | "population";
+export type FeedId = "firms" | "bmkg" | "grid" | "air" | "maritime" | "news" | "place" | "areas" | "population" | "crises" | "satellites";
 
 export interface FeedHealth {
   ok: boolean;
@@ -32,6 +32,8 @@ export const FEED_LABEL: Record<FeedId, string> = {
   place: "Permukiman OSM",
   areas: "Wilayah & berita area",
   population: "Penduduk WorldPop",
+  crises: "Krisis nasional",
+  satellites: "Orbit satelit (CelesTrak)",
 };
 
 let snapshot: Partial<Record<FeedId, FeedHealth>> = {};

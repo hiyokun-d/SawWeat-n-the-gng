@@ -13,6 +13,7 @@ import {
   THREAT_COLOR,
   THREAT_LABEL,
   wibTime,
+  aqiTextColor,
 } from "@/lib/gambut";
 import type { DangerArea } from "@/lib/dangerAreas";
 
@@ -158,7 +159,7 @@ function AreaCard({
                 {THREAT_LABEL[worst.threatLevel]}: {worst.name}
               </span>
             )}
-            {band && <span style={{ color: band.color }}>AQI {Math.round(a.air!.usAqi!)}</span>}
+            {band && <span style={{ color: aqiTextColor(a.air!.usAqi!) }}>AQI {Math.round(a.air!.usAqi!)}</span>}
             {a.news.length > 0 && <span className="text-sky-300">{a.news.length} berita</span>}
           </span>
         </span>

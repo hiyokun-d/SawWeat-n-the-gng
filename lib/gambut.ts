@@ -694,6 +694,16 @@ export const AQI_BANDS: AqiBand[] = [
   },
 ];
 
+/**
+ * Band color for text on the dark UI: the two darkest bands are lifted to a
+ * lighter shade of the same hue so the number passes WCAG AA on slate-950.
+ * Map fills keep the standard band color.
+ */
+export function aqiTextColor(usAqi: number): string {
+  const c = aqiBand(usAqi).color;
+  return c === "#9f1239" ? "#fb7185" : c === "#a855f7" ? "#c084fc" : c;
+}
+
 export function aqiBand(usAqi: number): AqiBand {
   return AQI_BANDS.find((b) => usAqi <= b.max) ?? AQI_BANDS[AQI_BANDS.length - 1];
 }

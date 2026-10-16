@@ -18,12 +18,14 @@ import {
   WavesIcon,
   WindIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ViewTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import NewsPortalModal from "@/components/dashboard/NewsPortalModal";
 import { AirCard, FilterPanel, ImpactPanel } from "@/components/dashboard/ImpactPanels";
-import PresentationMode from "@/components/dashboard/PresentationMode";
+import PresentationMode, { type Cut, type PresentationLayers } from "@/components/dashboard/PresentationMode";
+import BootSequence from "@/components/dashboard/BootSequence";
+import { useCrises } from "@/hooks/useCrises";
 import { DangerAreaList } from "@/components/dashboard/DangerAreas";
 import { buildDangerAreas, type DangerArea } from "@/lib/dangerAreas";
 import type { CameraShot } from "@/components/map/types";
@@ -47,8 +49,7 @@ import type { MapStyleId } from "@/lib/basemaps";
 import { MAP_STYLES } from "@/lib/basemaps";
 
 // Both engines touch `window` on import (Leaflet immediately, MapLibre on map creation),
-// so they load client-only. The engine hook keeps Leaflet mounted under MapLibre until
-// MapLibre signals ready, then the Leaflet layer fades out to reveal it.
+// so they load client-only. Leaflet is only loaded if MapLibre fails (no WebGL, timeout).
 const MapLibreMap = dynamic(() => import("@/components/map/MapLibreMap"), { ssr: false });
 const LeafletMap = dynamic(() => import("@/components/map/LeafletMap"), { ssr: false });
 import {
@@ -122,8 +123,8 @@ export default function DashboardPage() {
     firms,
   } = useIncidents();
 
-  const { engine, state: engineState, markReady, markFailed } = useMapEngine();
-  const [mapStyle, setMapStyle] = useState<MapStyleId>("liberty");
+  const { state: engineState, markReady, markFailed } = useMapEngine();
+  const [mapStyle, setMapStyle] = useState<MapStyleId>("dark");
   const [panelOpen, setPanelOpen] = useState(false);
   const [newsOpen, setNewsOpen] = useState(false);
   const [hourOffset, setHourOffset] = useState(0);
@@ -131,9 +132,14 @@ export default function DashboardPage() {
   const [tab, setTab] = useState<SidebarTab>("area");
   // "manual" from the button (full screen, exits only on Esc/close), "idle" as screensaver (any input exits)
   const [tour, setTour] = useState<null | "manual" | "idle">(null);
+  const [cut, setCut] = useState<Cut>("full");
+  const [tourLayers, setTourLayers] = useState<PresentationLayers | null>(null);
   const [camera, setCamera] = useState<CameraShot | null>(null);
+  const [booting, setBooting] = useState(true);
+  const crises = useCrises();
 
-  const startTour = () => {
+  const startTour = (c: Cut) => {
+    setCut(c);
     setTour("manual");
     document.documentElement.requestFullscreen?.().catch(() => {
       // Full screen is optional (blocked in some embeds)
@@ -142,16 +148,18 @@ export default function DashboardPage() {
   const exitTour = useCallback(() => {
     setTour(null);
     setCamera(null);
+    setTourLayers(null);
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
   }, []);
 
   // Screensaver: start after IDLE_MS without input; while idle-started, any input ends it
   useEffect(() => {
-    let timer = window.setTimeout(() => setTour((t) => t ?? "idle"), IDLE_MS);
+    const idle = () => setTour((t) => t ?? "idle");
+    let timer = window.setTimeout(idle, IDLE_MS);
     const onInput = () => {
       window.clearTimeout(timer);
       if (tour === "idle") exitTour();
-      timer = window.setTimeout(() => setTour((t) => t ?? "idle"), IDLE_MS);
+      timer = window.setTimeout(idle, IDLE_MS);
     };
     const events = ["pointerdown", "pointermove", "keydown", "wheel", "touchstart"] as const;
     events.forEach((e) => window.addEventListener(e, onInput, { passive: true }));
@@ -225,6 +233,9 @@ export default function DashboardPage() {
     chromeless: tour !== null,
     hourOffset,
     mapStyle,
+    crises: crises.data?.events,
+    showCrises: tourLayers?.crises,
+    showSatellites: tourLayers?.satellites,
     onSelectIncident: selectIncident,
     // The tour keeps the data it preloaded: camera flights must not swap the fire set
     onViewportChange: tour ? noop : setViewport,
@@ -289,9 +300,11 @@ export default function DashboardPage() {
             <FlameIcon className="size-4 text-orange-400" />
           </div>
           <div className="min-w-0">
-            <h1 className="truncate text-sm font-bold tracking-tight">
-              GambutWatch <span className="text-orange-400">Tactical DSS</span>
-            </h1>
+            <ViewTransition name="gw-brand" share="gw-morph" default="none">
+              <h1 className="truncate text-sm font-bold tracking-tight">
+                GambutWatch <span className="text-orange-400">Tactical DSS</span>
+              </h1>
+            </ViewTransition>
             <p className="hidden truncate text-[10px] text-muted-foreground sm:block">
               Fokus Indonesia · titik api NASA FIRMS seluruh dunia
             </p>
@@ -322,19 +335,36 @@ export default function DashboardPage() {
               </li>
             ))}
           </ul>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={startTour}
-            disabled={incidents.length === 0}
-            title={`Tur sinematik layar penuh (mulai sendiri setelah 3 menit tanpa aktivitas). Data dimuat di latar: ${tourReady.named}/${dangerAreas.length} area bernama, ${tourReady.news} berita, penduduk ${tourReady.population} titik.`}
-            className="h-7 gap-1.5 px-2 text-xs"
+          <div
+            className="flex items-center rounded-md border border-white/10"
+            title={`Data dimuat di latar: ${tourReady.named}/${dangerAreas.length} area bernama, ${tourReady.news} berita, penduduk ${tourReady.population} titik. Adegan tanpa data lengkap dilewati.`}
           >
-            <MonitorPlayIcon className="size-3.5" />
-            <span className="hidden lg:inline">Presentasi</span>
+            <MonitorPlayIcon className="ml-2 size-3.5 text-slate-300" aria-hidden />
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => startTour("short")}
+              disabled={incidents.length === 0}
+              className="h-7 px-2 text-xs"
+              aria-label="Presentasi ringkas 60 detik: urgensi dan zona prioritas"
+            >
+              60 dtk
+            </Button>
+            <span className="h-4 w-px bg-white/10" aria-hidden />
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => startTour("full")}
+              disabled={incidents.length === 0}
+              className="h-7 px-2 text-xs"
+              aria-label="Presentasi lengkap: semua data, krisis, berita dan respons"
+            >
+              Lengkap
+            </Button>
             {/* Fills as area names, news and population finish preloading */}
             <span
-              className="relative h-1 w-6 overflow-hidden rounded-full bg-white/15"
+              className="relative mr-2 h-1 w-6 overflow-hidden rounded-full bg-white/15"
+              role="img"
               aria-label={`Data presentasi ${Math.round(tourReady.ratio * 100)}% siap`}
             >
               <span
@@ -342,7 +372,7 @@ export default function DashboardPage() {
                 style={{ width: `${tourReady.ratio * 100}%` }}
               />
             </span>
-          </Button>
+          </div>
           {hasNews && (
             <Button
               size="sm"
@@ -438,8 +468,7 @@ export default function DashboardPage() {
           )}
         </AnimatePresence>
 
-        {/* Map: MapLibre 3D engine primary, Leaflet fallback underneath until ready,
-            then fades away to reveal it (same pattern as the original app) */}
+        {/* Map: MapLibre 3D engine primary; Leaflet replaces it only after a failure */}
         <main className="relative min-w-0 flex-1">
           {engineState.status !== "fallback" && (
             <div className="absolute inset-0 z-0">
@@ -447,7 +476,9 @@ export default function DashboardPage() {
             </div>
           )}
           <AnimatePresence>
-            {engine === "leaflet" && (
+            {/* Leaflet only when MapLibre has actually failed: mounting it underneath during load
+                doubled the tile downloads and drew every fire twice behind the boot screen */}
+            {engineState.status === "fallback" && (
               <motion.div
                 key="leaflet"
                 className="absolute inset-0 z-[5]"
@@ -562,8 +593,16 @@ export default function DashboardPage() {
             </AnimatePresence>
           </div>
 
+          {booting && (
+            <BootSequence mapReady={engineState.status !== "loading"} onDone={() => setBooting(false)} />
+          )}
+
           {tour && (
             <PresentationMode
+              cut={cut}
+              crises={crises.data}
+              news={newsArticles}
+              setLayers={setTourLayers}
               areas={dangerAreas}
               viewStats={viewStats}
               incidents={incidents}

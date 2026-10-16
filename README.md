@@ -110,3 +110,39 @@ bun install
 bun run dev      # http://localhost:3000
 bun run build    # build produksi
 ```
+
+## Presentasi & Video
+
+- `/present?cut=short` (60 detik: urgensi dan zona prioritas) dan `/present?cut=full`
+  (sekitar 3 menit 20 detik: satelit, konteks tahun ini, gambut, rambatan, udara,
+  respons, krisis nasional, berita, pemerintah, suara publik). Halaman memuat semua
+  data Indonesia di latar dan baru mulai saat datanya lengkap; adegan yang datanya
+  belum ada dilewati, bukan diisi angka karangan.
+- Dasbor punya tombol `60 dtk` dan `Lengkap` untuk tur yang sama di tempat.
+- Ekspor MP4 (16:9 untuk YouTube, 9:16 untuk Instagram) dengan musik:
+
+```
+bun run build && bun run start -- -p 3100   # server produksi
+bun run record                               # keempat video ke public/videos/
+node scripts/record-video.mjs --cut short --aspect portrait   # satu video saja
+```
+
+  Video bisa diunduh dari halaman awal. Musik: Kevin MacLeod (incompetech.com),
+  CC BY 4.0, dikreditkan di kartu penutup.
+
+## Sumber data tambahan
+
+| Sumber | Kegunaan |
+| --- | --- |
+| BMKG `data.bmkg.go.id/DataMKG/TEWS` | Gempa M4+ 14 hari (terkini & dirasakan) |
+| GDACS | Peringatan banjir, gunung api, siklon untuk Indonesia (30 hari) |
+| Google News RSS | Krisis yang diberitakan (BBM, banjir, kekeringan, kabut asap, harga pangan, listrik, KLB), respons pemerintah, suara publik. Dipetakan ke ibu kota provinsi yang disebut judul dan selalu diberi label "dilaporkan media" |
+| CelesTrak | Elemen orbit lima satelit FIRMS; posisi dihitung SGP4 di server |
+| SiPongi Kemenhut, World Bank (2016), WHO AQG 2021 | Angka konteks di presentasi lengkap (dikutip dengan sumber) |
+
+## Performa
+
+Lapisan peta MapLibre statis: peta hanya menggambar ulang saat kamera bergerak.
+Semua animasi (denyut api, bara, asap yang hanyut, garis sekat bakar dan evakuasi
+yang mengalir, satelit) digambar di satu kanvas 2D di atas peta. Ubin peta Indonesia
+sampai zoom 6 dimuat di waktu senggang.

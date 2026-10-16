@@ -43,3 +43,9 @@ next-env.d.ts
 
 # agent internal documentation
 agentic-docs/
+
+# server-side caches (WorldPop headcounts)
+/.cache/
+
+# exported presentation videos (large binaries; regenerate with `bun run record`)
+/public/videos/

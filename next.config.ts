@@ -6,6 +6,9 @@ const nextConfig: NextConfig = {
     agentFeedback: true,
   },
   cacheComponents: true,
+  // satellite.js ships an Emscripten worker runtime that the bundler cannot follow;
+  // it runs only in API routes, so Node loads it directly instead of bundling it
+  serverExternalPackages: ["satellite.js"],
   partialPrefetching: true,
   turbopack: {
     rules: {

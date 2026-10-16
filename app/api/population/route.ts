@@ -1,10 +1,37 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { z } from "zod";
 import { populationInRing, WORLDPOP_YEAR } from "@/lib/population";
 
 const MAX_ZONES = 40;
-const CONCURRENCY = 4;
+// WorldPop runs each zone as an async task; ten in flight finish a 40-zone batch in a few rounds
+const CONCURRENCY = 10;
 const CACHE_MS = 6 * 3600_000;
 const cache = new Map<string, { at: number; people: number }>();
+
+// WorldPop is slow and sometimes unreachable for minutes; headcounts it did return are kept on
+// disk so a server restart (or a video recording run) does not have to ask again
+const CACHE_FILE = path.join(process.cwd(), ".cache", "population.json");
+let loaded: Promise<void> | null = null;
+function loadDisk() {
+  loaded ??= readFile(CACHE_FILE, "utf8")
+    .then((text) => {
+      const now = Date.now();
+      for (const [k, v] of Object.entries(JSON.parse(text) as Record<string, { at: number; people: number }>)) {
+        if (now - v.at < CACHE_MS && !cache.has(k)) cache.set(k, v);
+      }
+    })
+    .catch(() => {});
+  return loaded;
+}
+async function saveDisk() {
+  try {
+    await mkdir(path.dirname(CACHE_FILE), { recursive: true });
+    await writeFile(CACHE_FILE, JSON.stringify(Object.fromEntries(cache)));
+  } catch {
+    // Disk cache is an optimization only
+  }
+}
 
 const BodySchema = z.object({
   zones: z
@@ -32,6 +59,7 @@ export async function POST(request: Request) {
     return Response.json({ ok: false, error: "Payload zona tidak valid" }, { status: 400 });
   }
 
+  await loadDisk();
   const started = Date.now();
   const now = Date.now();
   const results: Record<string, number | null> = {};
@@ -58,8 +86,11 @@ export async function POST(request: Request) {
     );
   }
 
+  if (todo.some((z) => results[z.id] !== null)) void saveDisk();
+  const answered = Object.values(results).some((v) => v !== null);
   return Response.json(
-    { ok: true, year: WORLDPOP_YEAR, results },
+    // ok=false when WorldPop answered nothing, so the client's feed health shows the outage
+    { ok: answered || parsed.data.zones.length === 0, year: WORLDPOP_YEAR, results, ...(answered ? {} : { error: "WorldPop tidak merespons" }) },
     { headers: todo.length > 0 ? { "x-upstream-ms": String(Date.now() - started) } : {} },
   );
 }

@@ -599,10 +599,12 @@ export function smokePlume(
   incident: Pick<HotspotIncident, "originLat" | "originLng" | "weather" | "frpMegawatt">,
   now: Date,
   hourOffset: number,
+  /** Fraction of the full reach (nested bands draw a soft, denser-near-the-fire plume). */
+  scale = 1,
 ): Feature<Polygon, { reachKm: number }> {
   const w = weatherAtHour(incident.weather, now, hourOffset);
   const strength = 1 + Math.min(incident.frpMegawatt, 300) / 100;
-  const reachKm = Math.min(60, Math.max(2, w.windSpeedKmh * 2 * strength));
+  const reachKm = Math.min(60, Math.max(2, w.windSpeedKmh * 2 * strength)) * scale;
   const origin = point([incident.originLng, incident.originLat]);
   const ring: Position[] = [[incident.originLng, incident.originLat]];
   for (let off = -18; off <= 18; off += 6) {

@@ -2,6 +2,8 @@
 
 // OpenFreeMap vector styles for MapLibre (attribution is embedded in each style)
 export const MAP_STYLES = [
+  // Default: fire glow and smoke read best on a dark ground, and it matches the ops-room theme
+  { id: "dark", label: "Dark", url: "https://tiles.openfreemap.org/styles/dark" },
   { id: "liberty", label: "Liberty", url: "https://tiles.openfreemap.org/styles/liberty" },
   { id: "bright", label: "Bright", url: "https://tiles.openfreemap.org/styles/bright" },
   { id: "positron", label: "Positron", url: "https://tiles.openfreemap.org/styles/positron" },
