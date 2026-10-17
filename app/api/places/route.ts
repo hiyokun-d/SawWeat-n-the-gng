@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import type { Settlement } from "@/lib/gambut";
 import { fetchPlacesInCells } from "@/lib/overpass";
+import { jsonResponse } from "@/lib/http";
 
 const MAX_CELLS = 40;
 const HALF_DEG = 0.25;
@@ -44,7 +45,8 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  return Response.json(
+  return jsonResponse(
+    request,
     { ok: true, cells: cells.map((c) => ({ key: c.key, places: cache.get(c.key)?.places ?? [] })) },
     { headers: missing.length > 0 ? { "x-upstream-ms": String(Date.now() - started) } : {} },
   );

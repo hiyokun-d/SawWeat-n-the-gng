@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { ViewTransition } from "react";
-import { FlameIcon, LayoutDashboardIcon, MonitorPlayIcon, SmartphoneIcon } from "lucide-react";
-import VideoDownloads from "@/components/VideoDownloads";
+import { FlameIcon, LayoutDashboardIcon, SmartphoneIcon } from "lucide-react";
 
 const focusRing = "focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-orange-400";
 
@@ -40,41 +39,15 @@ export default function Home() {
               Peta 3D seluruh Indonesia: titik api, rambatan, asap, udara, satelit, dan krisis nasional.
             </span>
           </Link>
-          <div className="grid gap-3">
-            <Link
-              href="/hud"
-              className={`flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-4 transition-colors hover:border-sky-400/40 hover:bg-sky-500/[0.06] ${focusRing}`}
-            >
-              <SmartphoneIcon className="size-5 shrink-0 text-sky-400" aria-hidden />
-              <span>
-                <span className="block font-semibold">HUD regu lapangan</span>
-                <span className="block text-sm text-slate-300">Kompas taktis dan verifikasi satu klik</span>
-              </span>
-            </Link>
-            <Link
-              href="/present?cut=short"
-              className={`flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-4 transition-colors hover:border-white/25 ${focusRing}`}
-            >
-              <MonitorPlayIcon className="size-5 shrink-0 text-slate-300" aria-hidden />
-              <span>
-                <span className="block font-semibold">Presentasi 60 detik</span>
-                <span className="block text-sm text-slate-300">Urgensi dan zona prioritas</span>
-              </span>
-            </Link>
-            <Link
-              href="/present?cut=full"
-              className={`flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.03] p-4 transition-colors hover:border-white/25 ${focusRing}`}
-            >
-              <MonitorPlayIcon className="size-5 shrink-0 text-slate-300" aria-hidden />
-              <span>
-                <span className="block font-semibold">Presentasi lengkap</span>
-                <span className="block text-sm text-slate-300">Semua data, krisis, berita, dan respons</span>
-              </span>
-            </Link>
-          </div>
+          <Link
+            href="/hud"
+            className={`flex flex-col gap-2 rounded-xl border border-white/10 bg-white/[0.03] p-5 transition-colors hover:border-sky-400/40 hover:bg-sky-500/[0.06] ${focusRing}`}
+          >
+            <SmartphoneIcon className="size-6 text-sky-400" aria-hidden />
+            <span className="text-lg font-semibold">HUD regu lapangan</span>
+            <span className="text-sm leading-relaxed text-slate-300">Kompas taktis dan verifikasi satu klik</span>
+          </Link>
         </nav>
-
-        <VideoDownloads />
 
         <p className="mt-10 max-w-2xl text-xs leading-relaxed text-slate-400">
           Data langsung: NASA FIRMS, BMKG, Open-Meteo / Copernicus CAMS, WorldPop, OpenStreetMap, GDACS, CelesTrak, Google

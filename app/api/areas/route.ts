@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { reverseRegion, type Region } from "@/lib/geocode";
 import { searchKarhutlaNews, type NewsArticle } from "@/lib/news";
+import { jsonResponse } from "@/lib/http";
 
 const MAX_CELLS = 30;
 const NEWS_CACHE_MS = 60 * 60_000;
@@ -70,7 +71,8 @@ export async function GET(request: NextRequest) {
     }),
   );
 
-  return Response.json(
+  return jsonResponse(
+    request,
     { ok: true, regions, news },
     { headers: { "x-upstream-ms": String(Date.now() - started) } },
   );

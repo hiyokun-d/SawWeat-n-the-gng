@@ -11,6 +11,7 @@ import {
 import { getIndonesiaTest, INDONESIA_BBOX } from "@/lib/indonesia";
 import { getSettlements, nearestSettlementIndex } from "@/lib/settlements";
 import { KHG_SUNGAI_KAPUAS_AMBawang } from "@/data/khgKalbar.geojson";
+import { prepareJson, sendJson, type PreparedJson } from "@/lib/http";
 
 // FIRMS refreshes its NRT files every few minutes, but new passes only land a
 // few times a day; 10 minutes keeps us far inside the keyed quota.
@@ -28,6 +29,8 @@ interface Snapshot {
 /** A fire further than this from any mapped village gets its village looked up on selection. */
 const VILLAGE_MAX_KM = 30;
 let cache: Snapshot | null = null;
+/** Encoded + gzipped answer for one snapshot and village list: 52k fires take ~100 ms to encode and compress. */
+let body: { snapshot: Snapshot; settlements: unknown; prepared: PreparedJson } | null = null;
 let inflight: Promise<Snapshot | null> | null = null;
 
 function inBox(lat: number, lng: number, [w, s, e, n]: readonly number[]) {
@@ -110,20 +113,29 @@ export async function GET(request: Request) {
     }
     // Villages are attached per request: the OpenStreetMap list may land after the FIRMS pull
     const settlements = await getSettlements(3_000);
-    const nearest = nearestSettlementIndex(settlements, undefined, VILLAGE_MAX_KM);
-    const withVillages: FusedHotspot[] = cache.hotspots.map((h) => ({
-      ...h,
-      nearestSettlement: inBox(h.lat, h.lng, SETTLEMENT_BBOX) ? nearest(h.lat, h.lng) : null,
-    }));
-    return NextResponse.json({
-      ok: true,
-      keyed: cache.keyed,
-      hotspots: encodeHotspots(withVillages, cache.baseTime),
-      detections: cache.detections,
-      sources: cache.sources,
-      attribution: FIRMS_ATTRIBUTION,
-      fetchedAt: new Date(cache.at).toISOString(),
-    }, { headers: upstreamMs === null ? {} : { "x-upstream-ms": String(upstreamMs) } });
+    if (!body || body.snapshot !== cache || body.settlements !== settlements) {
+      const nearest = nearestSettlementIndex(settlements, undefined, VILLAGE_MAX_KM);
+      const withVillages: FusedHotspot[] = cache.hotspots.map((h) => ({
+        ...h,
+        nearestSettlement: inBox(h.lat, h.lng, SETTLEMENT_BBOX) ? nearest(h.lat, h.lng) : null,
+      }));
+      body = {
+        snapshot: cache,
+        settlements,
+        prepared: prepareJson({
+          ok: true,
+          keyed: cache.keyed,
+          hotspots: encodeHotspots(withVillages, cache.baseTime),
+          detections: cache.detections,
+          sources: cache.sources,
+          attribution: FIRMS_ATTRIBUTION,
+          fetchedAt: new Date(cache.at).toISOString(),
+        }),
+      };
+    }
+    return sendJson(request, body.prepared, {
+      headers: upstreamMs === null ? {} : { "x-upstream-ms": String(upstreamMs) },
+    });
   } catch (err) {
     return NextResponse.json(
       {

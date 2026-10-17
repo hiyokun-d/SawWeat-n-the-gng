@@ -22,7 +22,7 @@ import {
   type WeatherTelemetry,
 } from "@/lib/gambut";
 import { hotspotToSource, type HotspotSource } from "@/data/hotspotSource";
-import { reportFeed, trackedJson } from "@/lib/apiHealth";
+import { backgroundSlot, reportFeed, trackedJson } from "@/lib/apiHealth";
 import {
   computeFirebreak,
   computeVillageThreat,
@@ -70,6 +70,9 @@ export const DEFAULT_FILTER: HotspotFilter = {
   region: "all",
   maxAgeHours: null,
 };
+
+/** Dashboard opening view: only fires burning right now; the Peta tab filter brings the rest back. */
+export const BURNING_FILTER: HotspotFilter = { ...DEFAULT_FILTER, statuses: ["CONFIRMED_FLAMING"] };
 
 /** Fires seen within this many hours pulse on the map. */
 export const FRESH_HOURS = 3;
@@ -178,7 +181,20 @@ function buildIncident(
     };
     geometryCache.set(source, cached);
   }
-  return {
+  // Same inputs, same object: unchanged fires then cost nothing downstream (map layers, lists)
+  const prev = incidentCache.get(source);
+  if (
+    prev &&
+    prev.weather === weather &&
+    prev.status === status &&
+    prev.nowcastPolygon === cached.geometry.nowcastPolygon &&
+    prev.nearestVillage === cached.geometry.nearestVillage &&
+    prev.lastVerifiedBy === verifiedBy &&
+    prev.lastVerifiedAt === verifiedAt
+  ) {
+    return prev;
+  }
+  const incident: HotspotIncident = {
     ...source,
     status,
     weather,
@@ -186,6 +202,19 @@ function buildIncident(
     lastVerifiedBy: verifiedBy,
     lastVerifiedAt: verifiedAt,
   };
+  incidentCache.set(source, incident);
+  return incident;
+}
+
+const incidentCache = new WeakMap<HotspotSource, HotspotIncident>();
+
+function sameRecord<T>(a: Record<string, T>, b: Record<string, T>): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => a[k] === b[k]);
+}
+
+function sameItems<T>(a: T[], b: T[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
 /** Statistics over every fire in the current view, simulated or not. */
@@ -304,6 +333,7 @@ export function useIncidents(
   initialViewport: Bbox = INDONESIA_VIEW,
   /** Fires kept simulated and preloaded regardless of the view (presentation scenes). */
   pinnedIds: string[] = [],
+  initialFilter: HotspotFilter = DEFAULT_FILTER,
 ): UseIncidentsResult {
   const [statuses, setStatuses] = useState<StatusMap>({});
   const [weather, setWeather] = useState<WeatherTelemetry | null>(null);
@@ -325,7 +355,7 @@ export function useIncidents(
   const [cellWeather, setCellWeather] = useState<Record<string, CellWeather>>({});
   const [places, setPlaces] = useState<Record<string, Settlement | null>>({});
   const [air, setAir] = useState<Record<string, AirQuality>>({});
-  const [filter, setFilter] = useState<HotspotFilter>(DEFAULT_FILTER);
+  const [filter, setFilter] = useState<HotspotFilter>(initialFilter);
   const requestedAir = useRef(new Set<string>());
   const [placesByCell, setPlacesByCell] = useState<Record<string, Settlement[]>>({});
   const requestedPlaceCells = useRef(new Set<string>());
@@ -747,7 +777,7 @@ export function useIncidents(
 
   /* ---------------- incidents (engine) ---------------- */
 
-  const { incidents, incidentWeatherSource, pendingWeather } = useMemo(() => {
+  const computed = useMemo(() => {
     const list: HotspotIncident[] = [];
     const sources: UseIncidentsResult["incidentWeatherSource"] = {};
     let pending = 0;
@@ -773,7 +803,8 @@ export function useIncidents(
           entry && hotspot.effectiveStatus === entry.status ? entry.verifiedAt : undefined,
         ),
       );
-      sources[hotspot.id] = { source: w.source, place: w.place };
+      // The cell entry itself (stable across renders), read only for its source and place
+      sources[hotspot.id] = w;
     }
     // Most urgent first: Indonesia, status, village threat, fire power
     list.sort(
@@ -786,6 +817,18 @@ export function useIncidents(
     );
     return { incidents: list, incidentWeatherSource: sources, pendingWeather: pending };
   }, [activeSources, cellWeather, placeWeather, places, placesByCell, statuses]);
+
+  // A feed answer that changed no fire keeps the previous array, so nothing downstream re-renders
+  const stableIncidents = useRef<HotspotIncident[]>([]);
+  if (!sameItems(stableIncidents.current, computed.incidents)) stableIncidents.current = computed.incidents;
+  const incidents = stableIncidents.current;
+
+  const { pendingWeather } = computed;
+  const stableSources = useRef<UseIncidentsResult["incidentWeatherSource"]>({});
+  if (!sameRecord(stableSources.current, computed.incidentWeatherSource)) {
+    stableSources.current = computed.incidentWeatherSource;
+  }
+  const incidentWeatherSource = stableSources.current;
 
   /* ---------------- WorldPop residents in danger and smoke zones ---------------- */
 
@@ -826,11 +869,13 @@ export function useIncidents(
             ];
           });
           const started = performance.now();
-          const res = await fetch("/api/population", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ zones }),
-          });
+          const res = await backgroundSlot(() =>
+            fetch("/api/population", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ zones }),
+            }),
+          );
           const json = (await res.json()) as { ok?: boolean; results?: Record<string, number | null> };
           reportFeed("population", {
             ok: json.ok === true,

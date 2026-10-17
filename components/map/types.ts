@@ -15,6 +15,11 @@ export interface GambutMapProps {
   focusId: string | null;
   /** Scripted camera move (presentation mode); a new `seq` triggers the flight. */
   camera?: CameraShot | null;
+  /**
+   * True while an opening screen covers the map: the globe turns slowly and the
+   * fly-in to Indonesia waits until this turns false. Omitted: fly in at once.
+   */
+  introHold?: boolean;
   /** Hide the map's own toolbar (presentation mode). */
   chromeless?: boolean;
   /** National crises (BMKG, GDACS, news-reported), drawn as markers. */

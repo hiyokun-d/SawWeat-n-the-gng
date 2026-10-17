@@ -146,6 +146,11 @@
 /* ---------- National crisis markers (map) ----------
    Dark disc + white glyph keeps every non-fire crisis in one cool family, so fire stays
    the only warm signal on the map; the ring carries severity on the same warm ramp. */
+.gw-crisis-anchor {
+  position: relative;
+  width: 30px;
+  height: 30px;
+}
 .gw-crisis {
   position: relative;
   display: grid;
@@ -157,14 +162,19 @@
   background: rgb(2 6 23 / 0.9);
   color: #f1f5f9;
   cursor: pointer;
-  transition: transform 160ms ease-out;
+  transition:
+    transform 160ms ease-out,
+    opacity 300ms ease-out;
 }
 .gw-crisis svg {
   width: 15px;
   height: 15px;
 }
+/* From globe distance tens of markers would pile into one blob: they shrink away */
 .gw-globe-far .gw-crisis {
-  visibility: hidden;
+  opacity: 0;
+  transform: scale(0.5);
+  pointer-events: none;
 }
 .gw-crisis:hover {
   transform: scale(1.12);
@@ -181,6 +191,36 @@
   border-radius: inherit;
   border: 2px solid var(--ring);
   animation: gw-ring 2.2s ease-out infinite;
+}
+/* Layer on: each disc springs in after its stagger delay with a burst ring in its severity color */
+.gw-crisis-anchor.gw-in .gw-crisis {
+  animation: gw-crisis-in 560ms cubic-bezier(0.34, 1.56, 0.64, 1) var(--d, 0ms) both;
+}
+.gw-crisis-anchor.gw-in::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  border: 2px solid var(--ring);
+  pointer-events: none;
+  animation: gw-crisis-burst 900ms ease-out var(--d, 0ms) both;
+}
+/* Layer off: shrink and fade, reverse order */
+.gw-crisis-anchor.gw-out .gw-crisis {
+  animation: gw-crisis-out 320ms cubic-bezier(0.55, 0, 1, 0.45) var(--d, 0ms) both;
+}
+@keyframes gw-crisis-in {
+  from { transform: scale(0) rotate(-40deg); opacity: 0; }
+  55% { opacity: 1; }
+  to { transform: scale(1) rotate(0); opacity: 1; }
+}
+@keyframes gw-crisis-burst {
+  0% { transform: scale(0.4); opacity: 0; }
+  20% { opacity: 0.9; }
+  100% { transform: scale(3); opacity: 0; }
+}
+@keyframes gw-crisis-out {
+  to { transform: scale(0.15); opacity: 0; }
 }
 @keyframes gw-ring {
   from { transform: scale(1); opacity: 0.8; }
@@ -234,6 +274,9 @@
 
 @media (prefers-reduced-motion: reduce) {
   .gw-crisis-s3::after { animation: none; opacity: 0.6; transform: scale(1.4); }
+  .gw-crisis-anchor.gw-in .gw-crisis,
+  .gw-crisis-anchor.gw-out .gw-crisis,
+  .gw-crisis-anchor.gw-in::before { animation: none; }
   ::view-transition-group(*),
   ::view-transition-old(*),
   ::view-transition-new(*) { animation: none !important; }

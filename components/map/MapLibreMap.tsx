@@ -15,6 +15,7 @@ import {
   RotateCwIcon,
   SatelliteIcon,
   SirenIcon,
+  FlameKindlingIcon,
   WindIcon,
 } from "lucide-react";
 import { motion } from "motion/react";
@@ -136,6 +137,14 @@ const SPACE_ZOOM = 5.5;
 const CRISIS_MIN_ZOOM = 3.4;
 const GROW_MS = 1400;
 
+function easeInOutCubic(x: number): number {
+  return x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2;
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 export default function MapLibreMap(props: MapLibreMapProps) {
   const { incidents, hotspots, air, selectedId, focusId, camera, chromeless, hourOffset, mapStyle, crises, showCrises, showSatellites } = props;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -155,7 +164,11 @@ export default function MapLibreMap(props: MapLibreMapProps) {
   const [airLayer, setAirLayer] = useState(true);
   const [evac, setEvac] = useState(true);
   const [sats, setSats] = useState(true);
-  const [crisisLayer, setCrisisLayer] = useState(true);
+  // Off by default: the opening view shows fires only; one click adds the national crises
+  const [crisisLayer, setCrisisLayer] = useState(false);
+  // Animated +12 h growth of the selected fire's burn area (overlay only, no map redraw)
+  const [spreadAnim, setSpreadAnim] = useState(true);
+  const introDone = useRef(false);
   const [farOut, setFarOut] = useState(true);
   const crisisMarkers = useRef<CrisisMarkers | null>(null);
   const motionLayer = useRef<MotionOverlay | null>(null);
@@ -168,6 +181,15 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     cb.current = props;
     env.current = { globe, terrain, buildings, columns, smoke, airLayer, evac };
   });
+
+  /** Cinematic arrival over Indonesia; the fires ignite in a sweep when the camera settles. */
+  const flyHome = (map: maplibregl.Map) => {
+    introDone.current = true;
+    const reduced = prefersReducedMotion();
+    map.flyTo({ ...HOME_CAMERA, duration: reduced ? 0 : 3800, curve: 1.55, easing: easeInOutCubic, essential: true });
+    map.once("moveend", () => motionLayer.current?.reveal());
+  };
+  const flyHomeRef = useRef(flyHome);
 
   useEffect(() => {
     let map: maplibregl.Map;
@@ -210,7 +232,13 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     // Ready as soon as the first style is in and our layers are installed.
     map.once("style.load", () => {
       cb.current.onReady();
-      map.flyTo({ ...HOME_CAMERA, duration: 4000, curve: 1.6, essential: true });
+      if (cb.current.introHold && !prefersReducedMotion()) {
+        // Behind the opening screen the planet turns toward Indonesia; the fly-in waits for it to close
+        map.jumpTo({ center: [INDONESIA_CENTER[0] - 80, 8], zoom: 1.45, pitch: 0, bearing: 0 });
+        map.easeTo({ center: [INDONESIA_CENTER[0] - 22, 0], zoom: 1.8, duration: 16_000, easing: (t) => t });
+      } else {
+        flyHomeRef.current(map);
+      }
     });
     // Country-level tiles go into the browser cache once the first view has painted
     map.once("idle", () => prefetchIndonesiaTiles(map));
@@ -279,6 +307,14 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     };
   }, []);
 
+  // The opening screen closed: leave the slow spin and fly in
+  const introHold = props.introHold;
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!ready || !map || introHold || introDone.current) return;
+    flyHomeRef.current(map);
+  }, [introHold, ready]);
+
   // National crises as DOM markers (tens of them, reused across feed refreshes)
   useEffect(() => {
     crisisMarkers.current?.update(crises ?? []);
@@ -310,14 +346,30 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     if (!ready || !map || !focusId) return;
     const target = cb.current.hotspots.find((h) => h.id === focusId);
     if (!target) return;
+    // Speed-based flight (short hops are quick, cross-country ones arc out), eased at both ends,
+    // then targeting brackets close on the fire
+    // Close enough that the +12 h burn area spans about 140 px, so its growth animation reads
+    const inc = cb.current.incidents.find((i) => i.id === focusId);
+    const reachM = inc?.forecastPolygons.at(-1)?.maxSpreadRadiusM;
+    const frameZoom = reachM
+      ? Math.log2((140 * 40_075_016.686 * Math.cos((target.lat * Math.PI) / 180)) / (512 * Math.max(reachM, 50)))
+      : 12;
     map.flyTo({
       center: [target.lng, target.lat],
-      zoom: Math.max(map.getZoom(), 12),
+      zoom: Math.min(16.5, Math.max(map.getZoom(), 12, frameZoom)),
       pitch: 58,
       bearing: map.getBearing() + 30,
-      duration: 2400,
+      curve: 1.42,
+      speed: 1.1,
+      maxDuration: 3400,
+      easing: easeInOutCubic,
       essential: true,
     });
+    const lock = () => motionLayer.current?.lockOn(target.lng, target.lat);
+    map.once("moveend", lock);
+    return () => {
+      map.off("moveend", lock);
+    };
   }, [focusId, ready]);
 
   // Scripted shots from presentation mode
@@ -630,6 +682,26 @@ export default function MapLibreMap(props: MapLibreMapProps) {
     motionLayer.current?.setScene(motionScene.current);
   }, [incidents, selectedId, hourOffset, ready, styleVersion]);
 
+  // Spread growth for the selected fire, shown on the live view only (a scrubbed hour shows its own polygon)
+  useEffect(() => {
+    if (!ready || !motionLayer.current) return;
+    const selected = incidents.find((i) => i.id === selectedId) ?? incidents[0];
+    const on = spreadAnim && hourOffset === 0 && selected && selected.status !== "EXTINGUISHED";
+    motionScene.current = {
+      ...motionScene.current,
+      spread: on
+        ? {
+            lng: selected.originLng,
+            lat: selected.originLat,
+            rings: [selected.nowcastPolygon, ...selected.forecastPolygons].map(
+              (p) => p.geojsonPolygon.geometry.coordinates[0] as [number, number][],
+            ),
+          }
+        : null,
+    };
+    motionLayer.current.setScene(motionScene.current);
+  }, [incidents, selectedId, hourOffset, spreadAnim, ready]);
+
   // Slow camera orbit
   useEffect(() => {
     const map = mapRef.current;
@@ -659,6 +731,7 @@ export default function MapLibreMap(props: MapLibreMapProps) {
       { label: "Arah asap", icon: WindIcon, on: smoke, set: setSmoke },
       { label: "Kualitas udara", icon: CloudFogIcon, on: airLayer, set: setAirLayer },
       { label: "Evakuasi", icon: FootprintsIcon, on: evac, set: setEvac },
+      { label: "Animasi rambatan", icon: FlameKindlingIcon, on: spreadAnim, set: setSpreadAnim },
       { label: "Krisis nasional", icon: SirenIcon, on: crisisLayer, set: setCrisisLayer },
       { label: "Satelit FIRMS", icon: SatelliteIcon, on: sats, set: setSats },
     ],
@@ -708,7 +781,7 @@ export default function MapLibreMap(props: MapLibreMapProps) {
             title="Kembali ke tampilan Indonesia"
             onClick={() => {
               setOrbit(false);
-              mapRef.current?.flyTo({ ...HOME_CAMERA, duration: 2200 });
+              mapRef.current?.flyTo({ ...HOME_CAMERA, duration: 2600, curve: 1.5, easing: easeInOutCubic });
             }}
           >
             <CompassIcon />

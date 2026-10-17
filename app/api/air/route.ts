@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import type { AirQuality } from "@/lib/gambut";
 import { fetchAirBatch } from "@/lib/weatherProviders";
+import { jsonResponse } from "@/lib/http";
 
 const MAX_CELLS = 80;
 const CACHE_MS = 30 * 60_000;
@@ -43,7 +44,8 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  return Response.json(
+  return jsonResponse(
+    request,
     {
       ok: true,
       cells: cells.flatMap((c) => {

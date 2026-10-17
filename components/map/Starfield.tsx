@@ -13,9 +13,15 @@ export default function Starfield({ visible }: { visible: boolean }) {
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
+    let drawn = "";
+    let raf = 0;
     const draw = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const { clientWidth: w, clientHeight: h } = canvas;
+      // Layout shifts while the feeds load fire the observer many times at the same size
+      const size = `${w}x${h}@${dpr}`;
+      if (size === drawn || w === 0 || h === 0) return;
+      drawn = size;
       canvas.width = w * dpr;
       canvas.height = h * dpr;
       const ctx = canvas.getContext("2d");
@@ -32,16 +38,23 @@ export default function Starfield({ visible }: { visible: boolean }) {
         const m = Math.pow(rand(), 3);
         const r = 0.35 + m * 1.3;
         const warm = rand() < 0.15;
-        ctx.fillStyle = warm ? `rgba(254,215,170,${0.25 + m * 0.7})` : `rgba(226,232,240,${0.2 + m * 0.75})`;
+        ctx.fillStyle = warm ? "rgb(254,215,170)" : "rgb(226,232,240)";
+        ctx.globalAlpha = warm ? 0.25 + m * 0.7 : 0.2 + m * 0.75;
         ctx.beginPath();
         ctx.arc(x, y, r, 0, Math.PI * 2);
         ctx.fill();
       }
     };
     draw();
-    const ro = new ResizeObserver(draw);
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(draw);
+    });
     ro.observe(canvas);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      cancelAnimationFrame(raf);
+    };
   }, []);
 
   return (

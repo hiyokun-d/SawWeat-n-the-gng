@@ -1,4 +1,3 @@
-import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
   newsSeverity,
@@ -14,6 +13,7 @@ import {
 } from "@/lib/crises";
 import { googleNewsRss, isIndonesianForestFire, type NewsArticle } from "@/lib/news";
 import { nearestProvince, provincesIn } from "@/lib/provinces";
+import { jsonResponse } from "@/lib/http";
 
 const CACHE_MS = 15 * 60_000;
 const TIMEOUT_MS = 8_000;
@@ -359,7 +359,7 @@ export async function GET(request: Request) {
     // A refresh where every feed failed keeps serving the last good one
     if (fresh.ok || !cache) cache = { at: Date.now(), data: fresh };
   }
-  return NextResponse.json(cache.data, {
+  return jsonResponse(request, cache.data, {
     status: cache.data.ok ? 200 : 502,
     headers: {
       "Cache-Control": "public, s-maxage=600, stale-while-revalidate=900",

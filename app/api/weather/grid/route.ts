@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import type { WeatherTelemetry } from "@/lib/gambut";
 import { getSettlements, nearestSettlementIndex } from "@/lib/settlements";
 import { fetchBmkg, fetchOpenMeteoBatch } from "@/lib/weatherProviders";
+import { jsonResponse } from "@/lib/http";
 
 const MAX_CELLS = 80;
 const CACHE_MS = 30 * 60_000;
@@ -91,7 +92,8 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  return Response.json(
+  return jsonResponse(
+    request,
     { ok: true, cells: [...result.values()] },
     { headers: missing.length > 0 ? { "x-upstream-ms": String(Date.now() - started) } : {} },
   );

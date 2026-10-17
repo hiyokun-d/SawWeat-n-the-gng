@@ -161,14 +161,28 @@ export function rainDamping(precipitationMmH: number): number {
   return Math.exp(-0.35 * Math.max(0, precipitationMmH));
 }
 
+// Every spread step asks for the weather at some instant; parsing the forecast's ISO stamps
+// once per telemetry object instead of per call took the simulation of 190 fires down a third
+const parsedTimes = new WeakMap<WeatherTelemetry, { currentMs: number; slotMs: number[] }>();
+
+function timesOf(weather: WeatherTelemetry) {
+  let t = parsedTimes.get(weather);
+  if (!t) {
+    t = { currentMs: Date.parse(weather.updatedAt), slotMs: (weather.forecast ?? []).map((s) => Date.parse(s.at)) };
+    parsedTimes.set(weather, t);
+  }
+  return t;
+}
+
 /** Weather in effect at an instant: the latest forecast slot already started, else the current reading. */
 export function weatherAt(weather: WeatherTelemetry, atMs: number) {
-  const currentMs = Date.parse(weather.updatedAt);
+  const { currentMs, slotMs } = timesOf(weather);
+  const forecast = weather.forecast ?? [];
   let slot: WeatherForecastStep | null = null;
-  for (const s of weather.forecast ?? []) {
-    const ms = Date.parse(s.at);
+  for (let i = 0; i < slotMs.length; i++) {
+    const ms = slotMs[i];
     if (ms > atMs) break;
-    if (ms > currentMs) slot = s;
+    if (ms > currentMs) slot = forecast[i];
   }
   const src = slot ?? {
     windSpeedKmh: weather.windSpeedKmh,
@@ -193,6 +207,9 @@ export function weatherAtHour(weather: WeatherTelemetry, now: Date, hourOffset: 
   return weatherAt(weather, now.getTime() + hourOffset * 3600_000);
 }
 
+/** Built once: toLocaleTimeString with options builds a new formatter on every call. */
+const WIB_CLOCK = new Intl.DateTimeFormat("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Pontianak" });
+
 function toTimeStep(
   hourOffset: number,
   now: Date,
@@ -202,11 +219,7 @@ function toTimeStep(
   const stamp = new Date(now.getTime() + hourOffset * 3600_000);
   return {
     hourOffset,
-    timestamp: stamp.toLocaleTimeString("id-ID", {
-      hour: "2-digit",
-      minute: "2-digit",
-      timeZone: "Asia/Pontianak",
-    }),
+    timestamp: WIB_CLOCK.format(stamp),
     geojsonPolygon: poly,
     burnedAreaHa: polygonAreaHa(poly),
     maxSpreadRadiusM: maxRadiusM,

@@ -181,3 +181,43 @@ export async function fetchAirBatch(points: { lat: number; lng: number }[]): Pro
     })),
   }));
 }
+
+const AirDailySchema = z.object({
+  hourly: z.object({ time: z.array(z.string()), pm2_5: z.array(z.number().nullable()) }),
+});
+
+/**
+ * Daily mean PM2.5 (CAMS via Open-Meteo) per point for the past `pastDays` and
+ * the next `forecastDays` WIB calendar days. Days with fewer than 12 hourly
+ * values are left out rather than averaged from a fragment.
+ */
+export async function fetchAirDaily(
+  points: { lat: number; lng: number }[],
+  pastDays: number,
+  forecastDays: number,
+): Promise<{ date: string; pm25: number }[][]> {
+  if (points.length === 0) return [];
+  const url =
+    `https://air-quality-api.open-meteo.com/v1/air-quality` +
+    `?latitude=${points.map((p) => p.lat.toFixed(3)).join(",")}` +
+    `&longitude=${points.map((p) => p.lng.toFixed(3)).join(",")}` +
+    `&hourly=pm2_5&past_days=${pastDays}&forecast_days=${forecastDays}&timezone=Asia%2FJakarta`;
+  const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(OPEN_METEO_TIMEOUT_MS * 2) });
+  if (!res.ok) throw new Error(`Open-Meteo Air HTTP ${res.status}`);
+  const json: unknown = await res.json();
+  const parsed = z.array(AirDailySchema).safeParse(Array.isArray(json) ? json : [json]);
+  if (!parsed.success) throw new Error("Format respons kualitas udara tidak dikenali");
+  return parsed.data.map(({ hourly }) => {
+    const sums = new Map<string, { sum: number; n: number }>();
+    hourly.time.forEach((t, i) => {
+      const v = hourly.pm2_5[i];
+      if (v === null) return;
+      const day = t.slice(0, 10);
+      const acc = sums.get(day) ?? { sum: 0, n: 0 };
+      acc.sum += v;
+      acc.n += 1;
+      sums.set(day, acc);
+    });
+    return [...sums.entries()].flatMap(([date, { sum, n }]) => (n >= 12 ? [{ date, pm25: sum / n }] : []));
+  });
+}

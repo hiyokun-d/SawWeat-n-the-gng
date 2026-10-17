@@ -1,6 +1,6 @@
-import { NextResponse } from "next/server";
 import { degreesLat, degreesLong, eciToGeodetic, gstime, propagate, twoline2satrec } from "satellite.js";
 import { FIRE_SATELLITES, type SatelliteTle, type SatellitesPayload, type SatelliteTrack } from "@/lib/satellites";
+import { jsonResponse } from "@/lib/http";
 
 // CelesTrak updates elements a few times a day and asks clients not to poll more often than that
 const TLE_CACHE_MS = 6 * 3_600_000;
@@ -70,7 +70,7 @@ export async function GET(request: Request) {
     stepS: STEP_S,
     sats,
   };
-  return NextResponse.json(body, {
+  return jsonResponse(request, body, {
     status: body.ok ? 200 : 502,
     headers: {
       "Cache-Control": "public, s-maxage=20, stale-while-revalidate=60",

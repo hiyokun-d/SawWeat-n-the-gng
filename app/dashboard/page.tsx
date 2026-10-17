@@ -18,12 +18,13 @@ import {
   WavesIcon,
   WindIcon,
 } from "lucide-react";
-import { ViewTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ViewTransition, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import NewsPortalModal from "@/components/dashboard/NewsPortalModal";
 import { AirCard, FilterPanel, ImpactPanel } from "@/components/dashboard/ImpactPanels";
-import PresentationMode, { type Cut, type PresentationLayers } from "@/components/dashboard/PresentationMode";
+import { IspaPanel } from "@/components/dashboard/IspaPanel";
+import type { Cut, PresentationLayers } from "@/components/dashboard/PresentationMode";
 import BootSequence from "@/components/dashboard/BootSequence";
 import { useCrises } from "@/hooks/useCrises";
 import { DangerAreaList } from "@/components/dashboard/DangerAreas";
@@ -39,7 +40,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-import { cellKey, useIncidents, type FirmsState, type HotspotFilter } from "@/hooks/useIncidents";
+import { BURNING_FILTER, cellKey, useIncidents, type FirmsState, type HotspotFilter } from "@/hooks/useIncidents";
 import { useNow } from "@/hooks/useNow";
 import { FEED_LABEL, useApiHealth, type FeedId } from "@/lib/apiHealth";
 import { headFireRate, moistureRetardation, weatherAtHour } from "@/lib/simulationEngine";
@@ -52,6 +53,9 @@ import { MAP_STYLES } from "@/lib/basemaps";
 // so they load client-only. Leaflet is only loaded if MapLibre fails (no WebGL, timeout).
 const MapLibreMap = dynamic(() => import("@/components/map/MapLibreMap"), { ssr: false });
 const LeafletMap = dynamic(() => import("@/components/map/LeafletMap"), { ssr: false });
+// The tour and its explainers are a third of the page's code and run only on demand
+const loadPresentation = () => import("@/components/dashboard/PresentationMode");
+const PresentationMode = dynamic(loadPresentation, { ssr: false });
 import {
   BmkgVillages,
   DEFAULT_ADM4,
@@ -121,7 +125,7 @@ export default function DashboardPage() {
     selectIncident,
     setViewport,
     firms,
-  } = useIncidents();
+  } = useIncidents(undefined, undefined, BURNING_FILTER);
 
   const { state: engineState, markReady, markFailed } = useMapEngine();
   const [mapStyle, setMapStyle] = useState<MapStyleId>("dark");
@@ -137,6 +141,13 @@ export default function DashboardPage() {
   const [camera, setCamera] = useState<CameraShot | null>(null);
   const [booting, setBooting] = useState(true);
   const crises = useCrises();
+
+  // Fetched once the dashboard is up, so starting the tour (or the screensaver) has no wait
+  useEffect(() => {
+    if (booting) return;
+    const id = window.requestIdleCallback?.(() => void loadPresentation()) ?? window.setTimeout(loadPresentation, 2000);
+    return () => window.cancelIdleCallback?.(id);
+  }, [booting]);
 
   const startTour = (c: Cut) => {
     setCut(c);
@@ -178,6 +189,8 @@ export default function DashboardPage() {
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, [tour, exitTour]);
 
+  const openNews = useCallback(() => setNewsOpen(true), []);
+  const closeNews = useCallback(() => setNewsOpen(false), []);
   const {
     articles: newsArticles,
     loading: newsLoading,
@@ -231,6 +244,7 @@ export default function DashboardPage() {
     focusId: tour ? null : focusId,
     camera,
     chromeless: tour !== null,
+    introHold: booting,
     hourOffset,
     mapStyle,
     crises: crises.data?.events,
@@ -276,7 +290,7 @@ export default function DashboardPage() {
       hourOffset={hourOffset}
       newsArticles={newsArticles}
       hasNews={hasNews}
-      onOpenNews={() => setNewsOpen(true)}
+      onOpenNews={openNews}
     />
   );
 
@@ -377,7 +391,7 @@ export default function DashboardPage() {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => setNewsOpen(true)}
+              onClick={openNews}
               aria-label={`Buka portal berita karhutla (${newsArticles.length} artikel)`}
               className="h-7 gap-1.5 border-sky-500/40 bg-sky-500/10 px-2.5 text-xs text-sky-200 hover:bg-sky-500/20 hover:text-sky-100"
             >
@@ -637,7 +651,7 @@ export default function DashboardPage() {
 
       <NewsPortalModal
         open={newsOpen}
-        onClose={() => setNewsOpen(false)}
+        onClose={closeNews}
         articles={newsArticles}
         loading={newsLoading}
         onRefresh={refreshNews}
@@ -680,7 +694,8 @@ interface SidebarContentProps {
   onOpenNews: () => void;
 }
 
-function SidebarContent({
+// Memoized: the page re-renders on every timeline tick and feed answer, most of which leave the sidebar unchanged
+const SidebarContent = memo(function SidebarContent({
   tab,
   setTab,
   engineState,
@@ -775,16 +790,14 @@ function SidebarContent({
                 </p>
               ) : (
                 <div className="flex flex-col gap-2">
-                  <AnimatePresence mode="popLayout" initial={false}>
-                    {incidents.slice(0, shown).map((incident) => (
-                      <IncidentCard
-                        key={incident.id}
-                        incident={incident}
-                            selected={incident.id === selectedId}
-                        onSelect={() => selectIncident(incident.id)}
-                      />
-                    ))}
-                  </AnimatePresence>
+                  {incidents.slice(0, shown).map((incident) => (
+                    <IncidentCard
+                      key={incident.id}
+                      incident={incident}
+                      selected={incident.id === selectedId}
+                      onSelect={selectIncident}
+                    />
+                  ))}
                   {incidents.length > shown && (
                     <Button
                       variant="outline"
@@ -819,6 +832,8 @@ function SidebarContent({
               viewStats={viewStats}
               population={population}
             />
+            <Separator />
+            <IspaPanel incidents={incidents} population={population} />
           </TabsContent>
 
           <TabsContent value="cuaca" className="flex flex-col gap-3">
@@ -1021,7 +1036,7 @@ function SidebarContent({
       </ScrollArea>
     </Tabs>
   );
-}
+});
 
 /* ------------------------------------------------------------------ widgets */
 
@@ -1046,27 +1061,27 @@ function EngineStatus({ state }: { state: MapEngineState }) {
   );
 }
 
-function IncidentCard({
+// Memoized per card: a new selection re-renders two cards, not thirty
+const IncidentCard = memo(function IncidentCard({
   incident,
   selected,
   onSelect,
 }: {
   incident: HotspotIncident;
   selected: boolean;
-  onSelect: () => void;
+  onSelect: (id: string) => void;
 }) {
   const statusColor = FIRE_STATUS_COLOR[incident.status];
   const village = incident.nearestVillage;
   const threatLevel = village?.threatLevel ?? null;
 
   return (
+    // No layout animation: measuring thirty cards on every feed answer cost more than it showed
     <motion.button
-      layout
       type="button"
-      onClick={onSelect}
+      onClick={() => onSelect(incident.id)}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -8 }}
       transition={{ duration: 0.25, ease: "easeOut" }}
       className={`flex w-full items-center gap-2.5 rounded-lg border p-2.5 text-left transition-colors ${
         selected
@@ -1114,7 +1129,7 @@ function IncidentCard({
       </div>
     </motion.button>
   );
-}
+});
 
 /** Forecast wind for the next 12 hours: where the push will turn. */
 function ForecastStrip({ weather }: { weather: NonNullable<ReturnType<typeof useIncidents>["weather"]> }) {
@@ -1148,7 +1163,7 @@ function ForecastStrip({ weather }: { weather: NonNullable<ReturnType<typeof use
   );
 }
 
-const FEED_ORDER: FeedId[] = ["firms", "bmkg", "grid", "maritime", "news", "place"];
+const FEED_ORDER: FeedId[] = ["firms", "bmkg", "grid", "maritime", "news", "place", "ispa"];
 
 function formatMs(ms: number | null): string {
   if (ms === null) return "cache";

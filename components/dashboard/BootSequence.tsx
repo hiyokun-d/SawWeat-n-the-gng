@@ -51,7 +51,12 @@ export default function BootSequence({ mapReady, onDone }: { mapReady: boolean; 
           key="boot"
           className="fixed inset-0 z-50 flex items-center bg-gradient-to-r from-slate-950 via-slate-950/85 to-slate-950/20 px-6 sm:px-12"
           initial={{ opacity: 1 }}
-          exit={{ opacity: 0, transition: { duration: reduced ? 0 : 0.9, ease: "easeInOut" } }}
+          // Slides off to the west as the camera starts its fly-in, handing the screen to the globe
+          exit={{
+            opacity: 0,
+            x: reduced ? 0 : -56,
+            transition: { duration: reduced ? 0 : 0.8, ease: [0.4, 0, 0.2, 1] },
+          }}
           role="status"
           aria-live="polite"
           aria-label="Memuat data langsung"

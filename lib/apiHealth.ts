@@ -8,7 +8,7 @@ import { useSyncExternalStore } from "react";
  * the upstream provider (the `x-upstream-ms` header the routes set).
  */
 
-export type FeedId = "firms" | "bmkg" | "grid" | "air" | "maritime" | "news" | "place" | "areas" | "population" | "crises" | "satellites";
+export type FeedId = "firms" | "bmkg" | "grid" | "air" | "maritime" | "news" | "place" | "areas" | "population" | "crises" | "satellites" | "ispa";
 
 export interface FeedHealth {
   ok: boolean;
@@ -34,6 +34,7 @@ export const FEED_LABEL: Record<FeedId, string> = {
   population: "Penduduk WorldPop",
   crises: "Krisis nasional",
   satellites: "Orbit satelit (CelesTrak)",
+  ispa: "ISPA (Kemenkes & model)",
 };
 
 let snapshot: Partial<Record<FeedId, FeedHealth>> = {};
@@ -49,6 +50,28 @@ export function reportFeed(id: FeedId, health: Omit<FeedHealth, "at">) {
 }
 
 /**
+ * Feeds that enrich the view (village names, kabupaten news, WorldPop) can take
+ * 10-30 s when their providers are slow. Over HTTP/1.1 the browser opens only
+ * six connections per server, so unchecked they queued every other request,
+ * the fires and weather included, for up to 14 s. They share two slots.
+ */
+const BACKGROUND_FEEDS = new Set<FeedId>(["place", "areas", "population"]);
+const BACKGROUND_SLOTS = 2;
+let backgroundBusy = 0;
+const backgroundQueue: (() => void)[] = [];
+
+export async function backgroundSlot<T>(run: () => Promise<T>): Promise<T> {
+  if (backgroundBusy >= BACKGROUND_SLOTS) await new Promise<void>((r) => backgroundQueue.push(r));
+  backgroundBusy++;
+  try {
+    return await run();
+  } finally {
+    backgroundBusy--;
+    backgroundQueue.shift()?.();
+  }
+}
+
+/**
  * fetch + timing. Resolves with the parsed JSON (or throws) and records the
  * outcome; `count` turns the JSON into an item count, `isOk` decides whether
  * the payload counts as data received.
@@ -58,9 +81,14 @@ export async function trackedJson<T = unknown>(
   url: string,
   options: { count?: (json: T) => number | null; isOk?: (json: T, res: Response) => boolean } = {},
 ): Promise<T> {
-  const started = performance.now();
+  let started = performance.now();
   try {
-    const res = await fetch(url, { cache: "no-store" });
+    const go = () => {
+      // Timed from when the request leaves, not from when it joined the queue
+      started = performance.now();
+      return fetch(url, { cache: "no-store" });
+    };
+    const res = BACKGROUND_FEEDS.has(id) ? await backgroundSlot(go) : await go();
     const json = (await res.json()) as T;
     const upstream = res.headers.get("x-upstream-ms");
     const ok = options.isOk ? options.isOk(json, res) : res.ok;
